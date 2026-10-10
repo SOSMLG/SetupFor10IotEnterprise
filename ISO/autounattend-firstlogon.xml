@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  minimal first-logon hook for the Win10IoT setup. not a full unattend file:
+  generate the rest with https://schneegans.de/windows/unattend-generator/ and
+  paste this FirstLogonCommands block into its oobeSystem pass.
+  layout on media: sources\$OEM$\$1\Setup\ = this repo (Install-*.ps1 at root,
+  ISO\FirstLogon.cmd + ISO\Offline\ gaps inside). that lands as C:\Setup\.
+  needs an admin first-logon user or the commands silently don't run.
+-->
+<unattend xmlns="urn:schemas-microsoft-com:unattend">
+  <settings pass="oobeSystem">
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+      <FirstLogonCommands>
+        <SynchronousCommand wcm:action="add">
+          <CommandLine>powershell -NoProfile -ExecutionPolicy Bypass -File "C:\Setup\ISO\FirstBoot.ps1"</CommandLine>
+          <Description>Win10IoT apps + tweaks (choco + github + staged gaps)</Description>
+          <Order>1</Order>
+        </SynchronousCommand>
+      </FirstLogonCommands>
+    </component>
+  </settings>
+</unattend>
