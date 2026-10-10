@@ -1,0 +1,7 @@
+# VLC config (vlcrc) - unknown keys are ignored, so this is safe to drop in.
+intf=qt
+qt-bgcone=0
+qt-darkmode=1
+snapshot-path=C:/Users/Public/Pictures
+sub-autodetect-fuzzy=1
+play-and-exit=0

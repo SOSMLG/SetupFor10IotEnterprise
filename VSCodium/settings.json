@@ -1,0 +1,77 @@
+{
+    "workbench.settings.applyToAllProfiles": [
+        "workbench.colorCustomizations",
+        "vscode-pets.theme"
+    ],
+    "editor.cursorBlinking": "phase",
+    "editor.cursorSmoothCaretAnimation": "on",
+    "animations.Install-Method": "Custom UI Style",
+    "animations.Enabled": true,
+    "editor.bracketPairColorization.enabled": true,
+    "editor.unicodeHighlight.invisibleCharacters": false,
+    "editor.unicodeHighlight.ambiguousCharacters": false,
+    "editor.fontWeight": "bold",
+    "editor.fontLigatures": false,
+    "workbench.editor.empty.hint": "hidden",
+    "emmet.preferences": {
+    },
+    "vscode-pets.throwBallWithMouse": true,
+    "vscode-pets.petSize": "small",
+    "python.analysis.completeFunctionParens": true,
+    "code-runner.clearPreviousOutput": true,
+    "code-runner.saveFileBeforeRun": true,
+    "editor.fontVariations": false,
+    "editor.fontFamily": "JetBrainsMono Nerd Font",
+    "editor.fontSize": 13,
+    "editor.formatOnSave": true,
+    "terminal.integrated.fontFamily": "JetBrainsMono Nerd Font",
+    "terminal.integrated.fontSize": 12,
+    "emmet.includeLanguages": {
+        "javascript": "javascriptreact"       
+    },
+    "emmet.triggerExpansionOnTab": true,
+    "github.copilot.enable": {
+        "plaintext": true,
+        "markdown": true,
+        "scminput": true
+    },
+    "editor.quickSuggestions": {
+        "comments": "on",
+        "strings": "inline"
+    },
+    "workbench.activityBar.location": "top",
+    "workbench.sideBar.location": "right",
+    "window.menuBarVisibility": "compact",
+    "window.commandCenter": false,
+    "workbench.colorTheme": "Default Dark+",
+    "workbench.colorCustomizations": {
+        "[Default Dark+]": {
+            "activityBar.background": "#0b0b0d",
+            "activityBar.foreground": "#e5484d",
+            "activityBar.activeBorder": "#e5484d",
+            "editor.background": "#0b0b0d",
+            "editor.foreground": "#f3e9e9",
+            "sideBar.background": "#141216",
+            "sideBarTitle.foreground": "#e5484d",
+            "statusBar.background": "#8b1113",
+            "statusBar.foreground": "#f3e9e9",
+            "titleBar.activeBackground": "#0b0b0d",
+            "titleBar.activeForeground": "#e5484d",
+            "tab.activeBackground": "#0b0b0d",
+            "tab.activeBorder": "#e5484d",
+            "tab.inactiveBackground": "#141216",
+            "terminal.background": "#0b0b0d",
+            "terminal.foreground": "#f3e9e9",
+            "button.background": "#8b1113",
+            "button.hoverBackground": "#e5484d",
+            "focusBorder": "#e5484d",
+            "selection.background": "#8b1113",
+            "editor.selectionBackground": "#8b111388",
+            "scrollbarSlider.background": "#8b111366",
+            "panel.background": "#0b0b0d",
+            "panelTitle.activeBorder": "#e5484d"
+        }
+    },
+    "vscode-pets.theme": "forest",
+    "settingsSync.ignoredSettings": []
+}

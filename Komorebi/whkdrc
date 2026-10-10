@@ -1,0 +1,83 @@
+.shell powershell
+
+# Sway port: WIN key = Sway Mod4. Vim hjkl everywhere, workspaces 1-10.
+# Native Windows (no bind needed, left untouched):
+#   Win alone = Start | Win+V = clipboard history | Win+Shift+S = snip
+#   Win+X = power menu | Alt+Tab = switcher | Win+L always locks (can't be captured)
+# Reload: win+shift+c (komorebi) like sway reload, win+o restarts whkd itself.
+
+win + shift + c         : komorebic reload-configuration
+win + o                 : taskkill /f /im whkd.exe; Start-Process whkd -WindowStyle hidden
+
+# Apps (sway $term / $file / $browser / $mod+a agent)
+win + return            : start powershell
+win + t                 : start explorer
+win + z                 : start helium
+win + a                 : Start-Process powershell -ArgumentList '-NoExit','-Command','opencode'
+
+# Windows (sway kill / fullscreen / floating / focus-toggle)
+win + shift + q         : komorebic close
+win + shift + m         : komorebic minimize
+win + space             : komorebic toggle-float
+win + f                 : komorebic toggle-monocle
+win + m                 : komorebic toggle-maximize
+win + p                 : komorebic toggle-pause
+win + q                 : komorebic retile
+win + shift + return    : komorebic promote
+win + x                 : komorebic flip-layout horizontal
+win + y                 : komorebic flip-layout vertical
+win + shift + e         : komorebic stop
+
+# Resize (sway has a resize mode; whkd doesn't, so direct binds with alt)
+alt + win + h           : komorebic resize-axis horizontal decrease
+alt + win + l           : komorebic resize-axis horizontal increase
+alt + win + j           : komorebic resize-axis vertical decrease
+alt + win + k           : komorebic resize-axis vertical increase
+
+# Focus (vim + arrows, like sway)
+win + h                 : komorebic focus left
+win + j                 : komorebic focus down
+win + k                 : komorebic focus up
+win + l                 : komorebic focus right
+win + left              : komorebic focus left
+win + down              : komorebic focus down
+win + up                : komorebic focus up
+win + right             : komorebic focus right
+
+# Move (vim + arrows, like sway)
+win + shift + h         : komorebic move left
+win + shift + j         : komorebic move down
+win + shift + k         : komorebic move up
+win + shift + l         : komorebic move right
+win + shift + left      : komorebic move left
+win + shift + down      : komorebic move down
+win + shift + up        : komorebic move up
+win + shift + right     : komorebic move right
+
+# Cycle focus
+win + oem_4             : komorebic cycle-focus previous
+win + oem_6             : komorebic cycle-focus next
+
+# Workspaces 1-10 (sway $ws1..$ws10)
+win + 1                 : komorebic focus-workspace 0
+win + 2                 : komorebic focus-workspace 1
+win + 3                 : komorebic focus-workspace 2
+win + 4                 : komorebic focus-workspace 3
+win + 5                 : komorebic focus-workspace 4
+win + 6                 : komorebic focus-workspace 5
+win + 7                 : komorebic focus-workspace 6
+win + 8                 : komorebic focus-workspace 7
+win + 9                 : komorebic focus-workspace 8
+win + 0                 : komorebic focus-workspace 9
+
+# Move windows across workspaces
+win + shift + 1         : komorebic move-to-workspace 0
+win + shift + 2         : komorebic move-to-workspace 1
+win + shift + 3         : komorebic move-to-workspace 2
+win + shift + 4         : komorebic move-to-workspace 3
+win + shift + 5         : komorebic move-to-workspace 4
+win + shift + 6         : komorebic move-to-workspace 5
+win + shift + 7         : komorebic move-to-workspace 6
+win + shift + 8         : komorebic move-to-workspace 7
+win + shift + 9         : komorebic move-to-workspace 8
+win + shift + 0         : komorebic move-to-workspace 9

@@ -1,0 +1,10 @@
+{
+  "homepage": "https://www.google.com",
+  "homepage_is_newtabpage": true,
+  "browser": {
+    "show_home_button": true
+  },
+  "bookmark_bar": {
+    "show_on_all_tabs": true
+  }
+}
