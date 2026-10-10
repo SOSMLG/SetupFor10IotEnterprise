@@ -24,10 +24,12 @@ param(
   [string]$OfflineDir = '',
   [string]$LogDir = 'C:\Windows\Logs\Win10IoT-Setup',
   [string]$DriverDir = '',
+  [string]$Dns = 'Cloudflare',
   [switch]$NoTweaks,
   [switch]$NoDebloat,
   [switch]$TweaksOnly,
-  [switch]$Reboot
+  [switch]$Reboot,
+  [switch]$Fixes
 )
 $ErrorActionPreference = 'Continue'
 Set-StrictMode -Version 2
@@ -45,6 +47,16 @@ function Log($m) { Write-Host ("[{0:HH:mm:ss}] {1}" -f (Get-Date), $m) }
 function Refresh-Path {
   # fresh installs don't land on PATH in this session. re-read it or python/codium are "missing".
   try { $env:Path = [System.Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [System.Environment]::GetEnvironmentVariable('Path','User') } catch {}
+}
+# native exes don't throw, and Start-Process never sets $LASTEXITCODE at all
+# (verified: stale code survives it). everything native goes through here.
+# returns the real exit code, -1 if it never even launched.
+function Invoke-Native([scriptblock]$cmd) {
+  $LASTEXITCODE = 0
+  $oldEA = $ErrorActionPreference; $ErrorActionPreference = 'Stop'
+  try { & $cmd 2>&1 | Out-Null; return $LASTEXITCODE }
+  catch { return -1 }
+  finally { $ErrorActionPreference = $oldEA }
 }
 # one-shot task from FirstBoot already fired. remove it so it never refires.
 try { Unregister-ScheduledTask -TaskName 'Win10IoT-Setup' -Confirm:$false -EA Stop } catch {}
@@ -87,6 +99,31 @@ if ((-not $online) -and (-not $TweaksOnly)) {
   else { Log 'WARN: still offline after 4 min - continuing with pre-seeded files only.' }
 }
 
+# ---------- 0. repairs. opt-in only (-Fixes), runs before everything. ----------
+if ($Fixes) {
+  Log 'Repairs...'
+  $exit = Invoke-Native { ipconfig /flushdns }
+  if ($exit -eq 0) { Log '  dns cache flushed.' } else { Log "  WARN flushdns exit=$exit" }
+  try {
+    foreach ($svc in @('Dnscache','NlaSvc')) {
+      if (Get-Service $svc -EA SilentlyContinue) { Restart-Service $svc -Force -EA Stop; Log "  svc restarted: $svc" }
+    }
+  } catch { Log "  WARN net services: $_" }
+  $exit = Invoke-Native { netsh winsock reset }
+  if ($exit -eq 0) { Log '  winsock reset (needs the reboot at the end).' } else { Log "  WARN winsock exit=$exit" }
+  if ($isAdmin) {
+    # update stack reset. stops services, parks the caches aside, starts over.
+    try {
+      foreach ($svc in @('wuauserv','bits','cryptsvc')) { Stop-Service $svc -Force -EA SilentlyContinue }
+      foreach ($d in @('C:\Windows\SoftwareDistribution','C:\Windows\System32\catroot2')) {
+        if ((Test-Path $d) -and -not (Test-Path "$d.bak")) { Rename-Item $d "$d.bak" -Force -EA Stop; Log "  parked: $d" }
+      }
+      foreach ($svc in @('cryptsvc','bits','wuauserv')) { Start-Service $svc -EA SilentlyContinue }
+      Log '  update stack reset.'
+    } catch { Log "  WARN update reset: $_" }
+  } else { Log '  update reset needs admin. skipped.' }
+}
+
 # ---------- 1. sane defaults first. hardening lands before gigabytes of downloads. ----------
 # win10 updates come as one blob, no security-only split exists.
 # LTSC + "tell me first" + no surprise reboots + no driver pushes. good enough.
@@ -100,6 +137,13 @@ function Set-Reg($path, $name, $value, $type = 'DWord') {
     New-ItemProperty -Path $path -Name $name -Value $value -PropertyType $type -Force -EA Stop | Out-Null
   } catch { Log "  WARN reg ${path}\${name}: $_" }
 }
+# dns providers. dhcp hands the address, -Dns picks who answers. DHCP = leave it alone.
+$dnsMap = @{
+  'Cloudflare' = @('1.1.1.1','1.0.0.1')
+  'Google' = @('8.8.8.8','8.8.4.4')
+  'Quad9' = @('9.9.9.9','149.112.112.112')
+  'DHCP' = @()
+}
 if (-not $NoTweaks) {
   Log 'Sane defaults...'
   if ($isAdmin) {
@@ -111,8 +155,9 @@ if (-not $NoTweaks) {
       $oosu = Join-Path $Repo 'OOSU\OOSHUTUP10.exe'
       $oocfg = Join-Path $Repo 'OOSU\ooshutup10.cfg'
       if ((Test-Path $oosu) -and (Test-Path $oocfg)) {
-        Start-Process $oosu -ArgumentList "`"$oocfg`"", '/quiet' -Wait -EA Stop
-        Log '  O&O ShutUp10++ applied (titus cfg).'
+        $proc = Start-Process $oosu -ArgumentList "`"$oocfg`"", '/quiet' -Wait -PassThru -EA Stop
+        if ($proc.ExitCode -eq 0) { Log '  O&O ShutUp10++ applied (titus cfg).' }
+        else { Log "  WARN O&O exit=$($proc.ExitCode)" }
       } else { Log '  O&O skipped (exe/cfg missing from OOSU/).' }
     } catch { Log "  WARN O&O: $_" }
     # 0 means security-level. only enterprise SKUs honor it, and this is one.
@@ -161,35 +206,83 @@ if (-not $NoTweaks) {
     # WPBT lets vendor blobs run at boot. off.
     Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' 'DisableWpbtExecution' 1
     # teredo off. xbox tunneling only, pure attack surface otherwise.
-    netsh interface teredo set state disabled 2>&1 | Out-Null
-    if ($LASTEXITCODE -eq 0) { Log '  teredo off.' } else { Log "  WARN teredo exit=$LASTEXITCODE" }
+    $exit = Invoke-Native { netsh interface teredo set state disabled }
+    if ($exit -eq 0) { Log '  teredo off.' } else { Log "  WARN teredo exit=$exit" }
     # clock reads RTC as UTC. dual-boot friendly, linux does the same.
     Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\TimeZoneInformation' 'RealTimeIsUniversal' 1
     # clock may be off after the rtc flip. sync once when online, warn and move on.
     if ($online) {
-      try {
-        $LASTEXITCODE = 0
-        w32tm /resync 2>&1 | Out-Null
-        if ($LASTEXITCODE -eq 0) { Log '  clock synced.' } else { Log "  WARN clock sync exit=$LASTEXITCODE (syncs on its own later)" }
-      } catch { Log "  WARN clock sync: $_" }
+      $exit = Invoke-Native { w32tm /resync }
+      if ($exit -eq 0) { Log '  clock synced.' } else { Log "  WARN clock sync exit=$exit (syncs on its own later)" }
     }
-    # high performance plan. tiny10 parks on balanced, bench boxes want full clocks.
-    powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635ec 2>&1 | Out-Null
-    if ($LASTEXITCODE -eq 0) { Log '  power: high performance.' } else { Log "  WARN power plan exit=$LASTEXITCODE" }
+    # ultimate plan if the sku carries it, high performance otherwise. tiny10 parks on balanced.
+    $exit = Invoke-Native { powercfg /duplicatescheme e9a42b02-d5df-448d-aa00-03f14749eb61 }
+    if ($exit -eq 0) { $exit = Invoke-Native { powercfg /setactive e9a42b02-d5df-448d-aa00-03f14749eb61 } }
+    if ($exit -eq 0) { Log '  power: ultimate performance.' }
+    else {
+      $exit = Invoke-Native { powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635ec }
+      if ($exit -eq 0) { Log '  power: high performance.' } else { Log "  WARN power plan exit=$exit" }
+    }
     # reserved storage off. small disks need those gigs back.
     try { Set-WindowsReservedStorageState -State Disabled -EA Stop; Log '  reserved storage off.' }
     catch { Log "  WARN reserved storage: $_" }
     # IPv4 preferred, IPv6 stays alive. full disable breaks things, this doesn't.
     Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters' 'DisabledComponents' 32
-    # cloudflare DNS on every live adapter. dhcp hands the address, we pick the resolver.
+    # resolver from -Dns on every live adapter.
     try {
-      Get-NetAdapter -Physical -EA Stop | Where-Object { $_.Status -eq 'Up' } | ForEach-Object {
-        Set-DnsClientServerAddress -InterfaceIndex $_.ifIndex -ServerAddresses @('1.1.1.1','1.0.0.1') -EA Stop
+      $servers = $null
+      if ($dnsMap.ContainsKey($Dns)) { $servers = $dnsMap[$Dns] }
+      if (-not $servers -or $servers.Count -eq 0) { Log "  DNS: left on DHCP ($Dns)." }
+      else {
+        Get-NetAdapter -Physical -EA Stop | Where-Object { $_.Status -eq 'Up' } | ForEach-Object {
+          Set-DnsClientServerAddress -InterfaceIndex $_.ifIndex -ServerAddresses $servers -EA Stop
+        }
+        Log "  DNS: $Dns on live adapters."
       }
-      Log '  DNS: cloudflare on live adapters.'
     } catch { Log "  WARN DNS: $_" }
     # notification center gone (toasts die per-user below).
     Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer' 'DisableNotificationCenter' 1
+    # hardening. lan-spoofing + credential hygiene. lab-safe: bench gear talks
+    # tcp/serial directly, none of it needs smb1, llmnr, netbios or wpad.
+    # smb1 off. 90s protocol, ransomware's favorite door.
+    try {
+      $smb = Get-WindowsOptionalFeature -Online -FeatureName 'SMB1Protocol' -EA Stop
+      if ($smb -and $smb.State -ne 'Disabled') { Disable-WindowsOptionalFeature -Online -FeatureName 'SMB1Protocol' -NoRestart -EA Stop | Out-Null; Log '  SMB1 removed.' }
+      else { Log '  SMB1 already gone.' }
+    } catch { Log "  WARN SMB1: $_" }
+    # llmnr off. poisoned answers on lab lans start here.
+    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient' 'EnableMulticast' 0
+    # netbios off per live adapter. same reason, older protocol.
+    try {
+      Get-WmiObject Win32_NetworkAdapterConfiguration -Filter "IPEnabled='TRUE'" -EA Stop | ForEach-Object {
+        $r = $_.SetTcpipNetbios(2)
+        if ($r.ReturnValue -in @(0,1)) { Log "  netbios off: $($_.Description)" }
+        else { Log "  WARN netbios $($_.Description): ret=$($r.ReturnValue)" }
+      }
+    } catch { Log "  WARN netbios: $_" }
+    # anonymous sam enumeration off. default on win10, stated plainly.
+    Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' 'RestrictAnonymous' 1
+    # remote assistance off. nobody helps this box remotely.
+    Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\Remote Assistance' 'fAllowToGetHelp' 0
+    # lsass runs protected. mimikatz-class tools bounce off.
+    Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' 'RunAsPPL' 1
+    # wdigest cleartext creds off. normal logons don't need it.
+    Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest' 'UseLogonCredential' 0
+    # guest account stays off.
+    try {
+      $g = Get-LocalUser -Name 'Guest' -EA Stop
+      if ($g.Enabled) { Disable-LocalUser -Name 'Guest' -EA Stop; Log '  guest disabled.' }
+      else { Log '  guest already off.' }
+    } catch { Log "  WARN guest: $_" }
+    # firewall on, all profiles. we never punch holes, so nothing breaks.
+    try { Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled True -EA Stop; Log '  firewall on (all profiles).' }
+    catch { Log "  WARN firewall: $_" }
+    # defender realtime on if the trim kept it. enabling only, never disabling.
+    try {
+      if (Get-Command Get-MpComputerStatus -EA SilentlyContinue) {
+        Set-MpPreference -DisableRealtimeMonitoring $false -EA Stop; Log '  defender realtime on.'
+      } else { Log '  defender absent on this trim. skipped.' }
+    } catch { Log "  WARN defender: $_" }
   } else { Log '  machine tweaks need admin. skipped.' }
   # per-user stuff, no admin needed.
   Set-Reg 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\AdvertisingInfo' 'Enabled' 0
@@ -264,6 +357,14 @@ if (-not $NoTweaks) {
   Set-Reg 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects' 'VisualFXSetting' 2
   Set-Reg 'HKCU:\Control Panel\Desktop' 'FontSmoothing' '2' 'String'
   Set-Reg 'HKCU:\Control Panel\Desktop' 'FontSmoothingType' 2
+  # balance, not scorched earth: kill animations + peek, keep shadows + content
+  # dragging so it still looks right. (winutil goes further; readability loses.)
+  Set-Reg 'HKCU:\Control Panel\Desktop\WindowMetrics' 'MinAnimate' '0' 'String'
+  Set-Reg 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced' 'TaskbarAnimations' 0
+  Set-Reg 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced' 'ListviewAlphaSelect' 0
+  Set-Reg 'HKCU:\SOFTWARE\Microsoft\Windows\DWM' 'EnableAeroPeek' 0
+  # fastest key repeat. keyboard-first box, pays off daily.
+  Set-Reg 'HKCU:\Control Panel\Keyboard' 'KeyboardDelay' 0
   # storage sense off. this box is managed by hand.
   Set-Reg 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\StorageSense\Parameters\StoragePolicy' '01' 0
   # no AI leftovers: inking + typing personalization off. copilot and recall
@@ -288,10 +389,7 @@ function Get-CmdPath($name) {
 function Test-WingetRuns {
   # staged on disk != runnable. gutted appx leaves a dead exe behind.
   if (-not (Get-Command winget -EA SilentlyContinue)) { return $false }
-  $oldEA = $ErrorActionPreference; $ErrorActionPreference = 'Stop'
-  try { & winget --version 2>&1 | Out-Null; return ($LASTEXITCODE -eq 0) }
-  catch { return $false }
-  finally { $ErrorActionPreference = $oldEA }
+  return ((Invoke-Native { winget --version }) -eq 0)
 }
 function Ensure-Winget {
   if (Test-WingetRuns) { Log 'winget: found.'; return $true }
@@ -360,9 +458,9 @@ function Ensure-Winget {
         if ($warOff -and $warOff.Extension -ne '.exe') {
           Add-AppxPackage -Path $warOff.FullName -EA Stop; Log "installed (offline): $($warOff.Name)"
         } elseif ($warOff) {
-          Start-Process $warOff.FullName -ArgumentList '--quiet' -Wait -EA Stop
-          if ($LASTEXITCODE -eq 0) { Log "installed (offline): $($warOff.Name)" }
-          else { Log "WARN WindowsAppRuntime offline exit=$LASTEXITCODE" }
+          $proc = Start-Process $warOff.FullName -ArgumentList '--quiet' -Wait -PassThru -EA Stop
+          if ($proc.ExitCode -eq 0) { Log "installed (offline): $($warOff.Name)" }
+          else { Log "WARN WindowsAppRuntime offline exit=$($proc.ExitCode)" }
         } else {
           $warExe = Join-Path $tmp 'windowsappruntimeinstall-x64.exe'
           try { if ((Test-Path $warExe) -and ((Get-Item $warExe).Length -lt 1MB)) { Remove-Item $warExe -Force -EA SilentlyContinue } } catch {}
@@ -371,9 +469,9 @@ function Ensure-Winget {
             Invoke-WebRequest -Uri 'https://aka.ms/windowsappsdk/1.8/latest/windowsappruntimeinstall-x64.exe' -OutFile $warExe -UseBasicParsing -TimeoutSec 600 -EA Stop
             Log "  got WindowsAppRuntime ($([math]::Round((Get-Item $warExe).Length/1MB,1)) MB)"
           } else { Log 'WindowsAppRuntime installer cached, using it.' }
-          Start-Process $warExe -ArgumentList '--quiet' -Wait -EA Stop
-          if ($LASTEXITCODE -eq 0) { Log 'installed: WindowsAppRuntime 1.8' }
-          else { Log "WARN WindowsAppRuntime exit=$LASTEXITCODE (winget may still fail with 0x80073CF3)" }
+          $proc = Start-Process $warExe -ArgumentList '--quiet' -Wait -PassThru -EA Stop
+          if ($proc.ExitCode -eq 0) { Log 'installed: WindowsAppRuntime 1.8' }
+          else { Log "WARN WindowsAppRuntime exit=$($proc.ExitCode) (winget may still fail with 0x80073CF3)" }
         }
       } else { Log 'dep already present, ok: WindowsAppRuntime 1.8' }
     } catch {
@@ -540,12 +638,11 @@ if ($isAdmin -and (-not $TweaksOnly)) {
   if ($sxs) { Log "  features source: $sxs" }
   foreach ($f in @('NetFx3','DirectPlay')) {
     # NOTE learned the hard way: native exes don't throw. check the exit code or the log lies.
-    $LASTEXITCODE = 0
-    if ($sxs) { DISM /Online /Enable-Feature /FeatureName:$f /All /NoRestart /LimitAccess "/Source:$sxs" | Out-Null }
-    else { DISM /Online /Enable-Feature /FeatureName:$f /All /NoRestart | Out-Null }
+    if ($sxs) { $exit = Invoke-Native { DISM /Online /Enable-Feature /FeatureName:$f /All /NoRestart /LimitAccess "/Source:$sxs" | Out-Null } }
+    else { $exit = Invoke-Native { DISM /Online /Enable-Feature /FeatureName:$f /All /NoRestart | Out-Null } }
     # 3010 = success, reboot pending. not a failure.
-    if ($LASTEXITCODE -in @(0,3010)) { Log "${f}: enabled.$(if ($LASTEXITCODE -eq 3010) { ' (reboot pending, normal)' })" }
-    else { Log "WARN ${f}: DISM exit=$LASTEXITCODE (insert install media so sources\sxs is visible) - enable manually for old vendor tools." }
+    if ($exit -in @(0,3010)) { Log "${f}: enabled.$(if ($exit -eq 3010) { ' (reboot pending, normal)' })" }
+    else { Log "WARN ${f}: DISM exit=$exit (insert install media so sources\sxs is visible) - enable manually for old vendor tools." }
   }
 } else { if (-not $TweaksOnly) { Log 'WARN NetFx3/DirectPlay: skipped (not admin).' } }
 # 4.8 is already in the image. moving on.
@@ -602,8 +699,8 @@ function Install-OfflineFile($file) {
   $seg = ($file.BaseName -split '[-_]')[0]
   switch ($file.Extension) {
     '.msi' {
-      Start-Process msiexec -ArgumentList '/i', "`"$($file.FullName)`"", '/qn', '/norestart' -Wait -EA Stop
-      if ($LASTEXITCODE -notin @(0,1641,3010)) { throw "msiexec exit=$LASTEXITCODE" }
+      $proc = Start-Process msiexec -ArgumentList '/i', "`"$($file.FullName)`"", '/qn', '/norestart' -Wait -PassThru -EA Stop
+      if ($proc.ExitCode -notin @(0,1641,3010)) { throw "msiexec exit=$($proc.ExitCode)" }
     }
     { $_ -in @('.appx','.msix','.msixbundle') } { Add-AppxPackage -Path $file.FullName -EA Stop }
     '.zip' {
@@ -622,26 +719,19 @@ function Install-OfflineFile($file) {
     default {
       $exe = $file.FullName
       if ($file.Name -like '*_burn_*') {
-        Start-Process $exe -ArgumentList '/install', '/quiet', '/norestart' -Wait -EA Stop
+        $proc = Start-Process $exe -ArgumentList '/install', '/quiet', '/norestart' -Wait -PassThru -EA Stop
       } elseif ($file.Name -like '*redist*' -or $file.Name -like '*dotnet*' -or $file.Name -like '*runtime*') {
-        Start-Process $exe -ArgumentList '/q' -Wait -EA Stop
+        $proc = Start-Process $exe -ArgumentList '/q' -Wait -PassThru -EA Stop
       } elseif ($file.Name -like '*python*') {
-        Start-Process $exe -ArgumentList '/quiet', 'InstallAllUsers=0', 'PrependPath=1' -Wait -EA Stop
+        $proc = Start-Process $exe -ArgumentList '/quiet', 'InstallAllUsers=0', 'PrependPath=1' -Wait -PassThru -EA Stop
       } elseif ($file.Name -like '*VSCodium*' -or $file.Name -like '*Git*' -or $file.Name -like '*Telegram*' -or $file.Name -like '*tsetup*' -or $file.Name -like '*td-setup*') {
-        Start-Process $exe -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait -EA Stop
+        $proc = Start-Process $exe -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait -PassThru -EA Stop
       } else {
-        Start-Process $exe -ArgumentList '/S' -Wait -EA Stop
+        $proc = Start-Process $exe -ArgumentList '/S' -Wait -PassThru -EA Stop
       }
-      if ($LASTEXITCODE -notin @(0,1641,3010)) { throw "installer exit=$LASTEXITCODE ($($file.Name))" }
+      if ($proc.ExitCode -notin @(0,1641,3010)) { throw "installer exit=$($proc.ExitCode) ($($file.Name))" }
     }
   }
-}
-# upgrade-all without the red wall. native exes don't throw, so EA Stop + exit check.
-function Invoke-Upgrade($label, [scriptblock]$cmd) {
-  $oldEA = $ErrorActionPreference; $ErrorActionPreference = 'Stop'
-  try { & $cmd 2>&1 | Out-Null; if ($LASTEXITCODE -ne 0) { Log "  WARN $label exit=$LASTEXITCODE" } else { Log "  $label done." } }
-  catch { Log "  WARN ${label}: $_" }
-  finally { $ErrorActionPreference = $oldEA }
 }
 if ((-not $TweaksOnly) -and ($hasWinget -or $hasChoco -or ($OfflineDir -and (Test-Path $OfflineDir)))) {
   foreach ($id in ($runtimeApps + $coreApps)) {
@@ -654,18 +744,16 @@ if ((-not $TweaksOnly) -and ($hasWinget -or $hasChoco -or ($OfflineDir -and (Tes
     }
     if ($hasWinget -and $online) {
       Log "winget install: $id"
-      $LASTEXITCODE = 0
-      winget install --id $id -e --silent --accept-source-agreements --accept-package-agreements
-      if ($LASTEXITCODE -eq 0) { Log '  ok'; continue }
-      Log "  WARN exit=$LASTEXITCODE, falling through"
+      $exit = Invoke-Native { winget install --id $id -e --silent --accept-source-agreements --accept-package-agreements }
+      if ($exit -eq 0) { Log '  ok'; continue }
+      Log "  WARN exit=$exit, falling through"
     }
     if ($hasChoco -and $chocoMap.ContainsKey($id)) {
       # NOTE native exe, exit code is the truth. try/catch alone lies.
       Log "choco install: $($chocoMap[$id]) (for $id)"
-      $LASTEXITCODE = 0
-      choco install $chocoMap[$id] -y --no-progress
-      if ($LASTEXITCODE -eq 0) { Log '  ok'; continue }
-      Log "  WARN exit=$LASTEXITCODE, falling through"
+      $exit = Invoke-Native { choco install $chocoMap[$id] -y --no-progress }
+      if ($exit -eq 0) { Log '  ok'; continue }
+      Log "  WARN exit=$exit, falling through"
     }
     if ($online -and $gitMap.ContainsKey($id)) {
       Log "github release: $id"
@@ -685,9 +773,15 @@ if ((-not $TweaksOnly) -and ($hasWinget -or $hasChoco -or ($OfflineDir -and (Tes
       $failed += $id
     } else { $failed += $id }
   }
-  if ($hasWinget -and $online) { Invoke-Upgrade 'winget upgrade' { winget upgrade --all --silent --accept-source-agreements --accept-package-agreements } }
+  if ($hasWinget -and $online) {
+    $exit = Invoke-Native { winget upgrade --all --silent --accept-source-agreements --accept-package-agreements }
+    if ($exit -eq 0) { Log '  winget upgrade done.' } else { Log "  WARN winget upgrade exit=$exit" }
+  }
   elseif ($hasWinget) { Log 'SKIP winget upgrade (offline).' }
-  if ($hasChoco -and $online) { Invoke-Upgrade 'choco upgrade' { choco upgrade all -y --no-progress } }
+  if ($hasChoco -and $online) {
+    $exit = Invoke-Native { choco upgrade all -y --no-progress }
+    if ($exit -eq 0) { Log '  choco upgrade done.' } else { Log "  WARN choco upgrade exit=$exit" }
+  }
   elseif ($hasChoco) { Log 'SKIP choco upgrade (offline).' }
 } elseif ($TweaksOnly) { Log 'Tweaks-only: apps skipped.' } else {
   Log 'SKIP installs (no winget, no choco, no -OfflineDir). Get net for choco, or stage with Get-Offline.ps1 - nothing marked failed yet.'
@@ -701,10 +795,9 @@ Log 'PATH refreshed.'
 if ($DriverDir -and (Test-Path $DriverDir) -and (-not $TweaksOnly)) {
   if ($isAdmin) {
     Log "drivers: $DriverDir"
-    $LASTEXITCODE = 0
-    pnputil /add-driver "$DriverDir\*.inf" /subdirs /install 2>&1 | Out-Null
-    if ($LASTEXITCODE -in @(0,3010)) { Log "  drivers staged+installed$(if ($LASTEXITCODE -eq 3010) { ' (reboot pending)' })" }
-    else { Log "  WARN pnputil exit=$LASTEXITCODE (check the inf folder, install manually)" }
+    $exit = Invoke-Native { pnputil /add-driver "$DriverDir\*.inf" /subdirs /install }
+    if ($exit -in @(0,3010)) { Log "  drivers staged+installed$(if ($exit -eq 3010) { ' (reboot pending)' })" }
+    else { Log "  WARN pnputil exit=$exit (check the inf folder, install manually)" }
   } else { Log '  WARN drivers: skipped (not admin).' }
 } elseif ($DriverDir) { Log '  WARN drivers: folder missing or tweaks-only run.' }
 
@@ -762,9 +855,8 @@ if ($codium -and (Test-Path $codium)) {
   }
   foreach ($ext in $extList) {
     try {
-      $LASTEXITCODE = 0
-      & $codium --install-extension $ext 2>&1 | Out-Null
-      if ($LASTEXITCODE -ne 0) { throw "exit=$LASTEXITCODE" }
+      $exit = Invoke-Native { & $codium --install-extension $ext }
+      if ($exit -ne 0) { throw "exit=$exit" }
       Log "  vscodium ext: $ext"
     }
     catch { Log "  WARN vscodium ext ${ext}: install manually from Open VSX." }
@@ -774,12 +866,10 @@ if ($codium -and (Test-Path $codium)) {
 
 # pip libs for bench work. needs python on PATH, so this runs after the refresh above.
 try {
-  $LASTEXITCODE = 0
-  & python -m pip install --upgrade pip 2>&1 | Out-Null
-  if ($LASTEXITCODE -ne 0) { throw "pip upgrade exit=$LASTEXITCODE" }
-  $LASTEXITCODE = 0
-  & python -m pip install numpy scipy matplotlib pyserial pymodbus 2>&1 | Out-Null
-  if ($LASTEXITCODE -ne 0) { throw "pip install exit=$LASTEXITCODE" }
+  $exit = Invoke-Native { python -m pip install --upgrade pip }
+  if ($exit -ne 0) { throw "pip upgrade exit=$exit" }
+  $exit = Invoke-Native { python -m pip install numpy scipy matplotlib pyserial pymodbus }
+  if ($exit -ne 0) { throw "pip install exit=$exit" }
   Log '  python libs: numpy scipy matplotlib pyserial pymodbus'
 } catch { Log '  WARN pip libs skipped - run manually: python -m pip install numpy scipy matplotlib pyserial pymodbus' }
 
@@ -830,8 +920,9 @@ if ((-not $NoDebloat) -and (-not $TweaksOnly)) {
         Sort-Object Name -Descending | Select-Object -First 1
       $edgeSetup = if ($edgeVer) { Join-Path $edgeVer.FullName 'Installer\setup.exe' } else { $null }
       if ($edgeSetup -and (Test-Path $edgeSetup)) {
-        Start-Process $edgeSetup -ArgumentList '--uninstall','--system-level','--force-uninstall' -Wait -EA Stop
-        Log '  Edge uninstalled (edgeupdate services left alone - other MS apps may use them).'
+        $proc = Start-Process $edgeSetup -ArgumentList '--uninstall','--system-level','--force-uninstall' -Wait -PassThru -EA Stop
+        if ($proc.ExitCode -eq 0) { Log '  Edge uninstalled (edgeupdate services left alone - other MS apps may use them).' }
+        else { Log "  WARN Edge exit=$($proc.ExitCode)" }
       } else { Log '  Edge already gone.' }
     } catch { Log "  WARN Edge: $_" }
     try {
@@ -855,9 +946,27 @@ if ((-not $NoDebloat) -and (-not $TweaksOnly)) {
     try {
       $od = "$env:SystemRoot\SysWOW64\OneDriveSetup.exe"
       if (-not (Test-Path $od)) { $od = "$env:SystemRoot\System32\OneDriveSetup.exe" }
-      if (Test-Path $od) { Start-Process $od -ArgumentList '/uninstall' -Wait -EA Stop; Log '  OneDrive removed.' }
+      if (Test-Path $od) {
+        $proc = Start-Process $od -ArgumentList '/uninstall' -Wait -PassThru -EA Stop
+        if ($proc.ExitCode -eq 0) { Log '  OneDrive removed.' } else { Log "  WARN OneDrive exit=$($proc.ExitCode)" }
+      }
       else { Log '  OneDrive already gone.' }
     } catch { Log "  WARN OneDrive: $_" }
+    # appx leftovers (bing, solitaire, xbox...). tiny10 usually has none; normal boxes do.
+    if (Get-Command Get-AppxPackage -EA SilentlyContinue) {
+      foreach ($fam in @('Microsoft.BingNews','Microsoft.BingWeather','Microsoft.GetHelp','Microsoft.Getstarted','Microsoft.MicrosoftOfficeHub','Microsoft.MicrosoftSolitaireCollection','Microsoft.People','Microsoft.WindowsFeedbackHub','Microsoft.YourPhone','Microsoft.ZuneMusic','Microsoft.ZuneVideo','Microsoft.SkypeApp','Microsoft.MixedReality.Portal','Microsoft.Print3D','Microsoft.XboxApp','Microsoft.XboxGameOverlay','Microsoft.XboxGamingOverlay','Microsoft.XboxSpeechToTextOverlay','Microsoft.Xbox.TCUI')) {
+        try {
+          Get-AppxPackage -Name "$fam*" -EA Stop | ForEach-Object {
+            try { Remove-AppxPackage -Package $_.PackageFullName -EA Stop; Log "  appx removed: $($_.Name)" }
+            catch { Log "  WARN appx $($_.Name): $_" }
+          }
+          Get-AppxProvisionedPackage -Online -EA Stop | Where-Object { $_.DisplayName -like "$fam*" } | ForEach-Object {
+            try { Remove-AppxProvisionedPackage -Online -PackageName $_.PackageName -EA Stop | Out-Null; Log "  provisioned removed: $($_.DisplayName)" }
+            catch { Log "  WARN provisioned $($_.DisplayName): $_" }
+          }
+        } catch { Log "  WARN appx sweep ${fam}: $_" }
+      }
+    } else { Log '  appx sweep skipped (no appx provider).' }
   }
 } else { if ($TweaksOnly) { Log 'Tweaks-only: debloat skipped.' } else { Log 'Debloat skipped (-NoDebloat).' } }
 
@@ -920,14 +1029,8 @@ if (-not $TweaksOnly) {
     @{ n='opencode'; cmd={ opencode --version } },
     @{ n='7zip'; cmd={ Get-Command 7z -EA Stop | Out-Null } }
   )) {
-    $oldEA = $ErrorActionPreference; $ErrorActionPreference = 'Stop'
-    try {
-      $LASTEXITCODE = 0
-      $cb = $s.cmd; & $cb 2>&1 | Out-Null
-      if ($LASTEXITCODE -eq 0) { Log "  smoke ok: $($s.n)" }
-      else { Log "  smoke MISSING: $($s.n) (exit=$LASTEXITCODE)" }
-    } catch { Log "  smoke MISSING: $($s.n)" }
-    finally { $ErrorActionPreference = $oldEA }
+    if ((Invoke-Native $s.cmd) -eq 0) { Log "  smoke ok: $($s.n)" }
+    else { Log "  smoke MISSING: $($s.n)" }
   }
 }
 
@@ -949,9 +1052,8 @@ if (-not $NoTweaks) {
   } catch {}
   if ($isAdmin) {
     # hibernate off (frees hiberfil.sys - matters on small tiny10 disks)
-    $LASTEXITCODE = 0
-    powercfg /hibernate off 2>&1 | Out-Null
-    if ($LASTEXITCODE -eq 0) { Log '  hibernation off.' } else { Log "  WARN hibernate exit=$LASTEXITCODE" }
+    $exit = Invoke-Native { powercfg /hibernate off }
+    if ($exit -eq 0) { Log '  hibernation off.' } else { Log "  WARN hibernate exit=$exit" }
     # disk cleanup, no prompts (may be stripped on tiny10 -> warn only)
     try { Start-Process cleanmgr -ArgumentList '/VERYLOWDISK' -Wait -EA Stop; Log '  disk cleanup done.' }
     catch { Log '  WARN disk cleanup: cleanmgr missing (common on tiny10).' }

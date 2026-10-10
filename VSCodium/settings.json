@@ -25,6 +25,10 @@
     "editor.guides.bracketPairs": true,
     "editor.fontFamily": "JetBrainsMono Nerd Font",
     "editor.fontSize": 13,
+    "editor.minimap.enabled": false,
+    "editor.renderWhitespace": "boundary",
+    "git.autofetch": true,
+    "update.showReleaseNotes": false,
     "terminal.integrated.fontFamily": "JetBrainsMono Nerd Font",
     "terminal.integrated.fontSize": 12,
     "emmet.includeLanguages": {

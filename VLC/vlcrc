@@ -1,7 +1,9 @@
 # VLC config (vlcrc) - unknown keys are ignored, so this is safe to drop in.
+# stock look, minimal chrome, gpu decode with software fallback.
 intf=qt
 qt-bgcone=0
-qt-darkmode=1
+qt-minimal-view=1
+avcodec-hw=d3d11va
 snapshot-path=C:/Users/Public/Pictures
 sub-autodetect-fuzzy=1
 play-and-exit=0

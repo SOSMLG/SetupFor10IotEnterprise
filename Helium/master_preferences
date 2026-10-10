@@ -6,5 +6,13 @@
   },
   "bookmark_bar": {
     "show_on_all_tabs": true
+  },
+  "distribution": {
+    "skip_first_run_ui": true,
+    "show_welcome_page": false,
+    "import_bookmarks": false,
+    "import_history": false,
+    "import_home_page": false,
+    "do_not_create_desktop_shortcut": true
   }
 }

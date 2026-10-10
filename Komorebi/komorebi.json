@@ -10,6 +10,11 @@
   "border_style": "System",
   "border_width": 3,
   "border_offset": 0,
+  "floating_applications": [
+    { "kind": "Exe", "id": "notepad.exe", "matching_strategy": "Equals" },
+    { "kind": "Exe", "id": "Taskmgr.exe", "matching_strategy": "Equals" },
+    { "kind": "Exe", "id": "calc.exe", "matching_strategy": "Equals" }
+  ],
   "mouse_follows_focus": false,
   "transparency": true,
   "transparency_alpha": 250,
