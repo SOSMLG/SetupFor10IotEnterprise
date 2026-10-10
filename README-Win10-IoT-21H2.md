@@ -1,6 +1,5 @@
 # Win10 IoT Enterprise 21H2 adaptation (slim)
 
-Source: `../` (Ultimate-Win11-Setup). This folder holds only what the slim setup needs.
 
 ## Scope (per your choices)
 - Shell: stock PowerShell 5.1 + minimal profile.
