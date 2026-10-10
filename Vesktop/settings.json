@@ -8,6 +8,14 @@
   "autoUpdate": true,
   "autoUpdateNotification": true,
   "useQuickCss": true,
+  "plugins": {
+    "VolumeBooster": { "enabled": true },
+    "SilentTyping": { "enabled": true },
+    "ReadAllNotificationsButton": { "enabled": true },
+    "GameActivityToggle": { "enabled": true },
+    "AnonymiseFileNames": { "enabled": true },
+    "BetterSessions": { "enabled": true }
+  },
   "notifications": {
     "timeout": 5000,
     "position": "bottom-right"

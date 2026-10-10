@@ -277,6 +277,9 @@ if (Get-Command pwsh -EA SilentlyContinue) {
 Copy-Config (Join-Path $Repo 'Komorebi\komorebi.json') (Join-Path $env:USERPROFILE 'komorebi.json')
 Copy-Config (Join-Path $Repo 'Komorebi\whkdrc') (Join-Path $env:USERPROFILE '.config\whkd\whkdrc')
 
+# git defaults. identity stays blank, that's yours to fill in after install.
+Copy-Config (Join-Path $Repo 'Git\.gitconfig') (Join-Path $env:USERPROFILE '.gitconfig')
+
 # vscodium eats vscode settings as-is. extensions come from open vsx though.
 $vs = Join-Path $env:APPDATA 'VSCodium\User\settings.json'
 if (Test-Path (Split-Path $vs)) { Copy-Config (Join-Path $Repo 'VSCodium\settings.json') $vs }
@@ -463,6 +466,12 @@ if (-not $NoTweaks) {
   Set-Reg 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize' 'AppsUseLightTheme' 0
   Set-Reg 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize' 'SystemUsesLightTheme' 0
   Set-Reg 'HKCU:\Control Panel\Desktop' 'MenuShowDelay' '100' 'String'
+  # red accent on taskbar + start, matches everything else. needs the prevalence flag or it won't show.
+  Set-Reg 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Accent' 'AccentColorMenu' 5064933
+  Set-Reg 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize' 'ColorPrevalence' 1
+  # console reds. errors and diffs pick these up in every terminal.
+  Set-Reg 'HKCU:\Console' 'ColorTable04' 5064933
+  Set-Reg 'HKCU:\Console' 'ColorTable12' 6906879
   # background apps: none. stuff runs when opened, not before.
   Set-Reg 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications' 'GlobalUserDisabled' 1
   # quiet box: toast popups off. (notification center itself dies machine-side above.)

@@ -1,4 +1,10 @@
 # VSCodium extensions (Open VSX) - installed by Install-Win10-IoT-21H2.ps1, or manually:
 #   codium --install-extension <id>
+# Lines starting with # are skipped by the installer.
 yasirarafat.opencode-ai-chat
 Gimly81.matlab
+ms-python.python
+eamodio.gitlens
+usernamehw.errorlens
+#redhat.vscode-yaml
+#tamasfe.even-better-toml

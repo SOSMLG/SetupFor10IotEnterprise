@@ -7,3 +7,9 @@
   offered; Privacy: block third-party cookies; set Helium as default
   (installer tries `--make-default-browser`, confirm in Windows Settings).
 - Lives on ws2 here (`Win+2`).
+- Nothing to tune, honestly. Helium already blocks ads/trackers/cookie
+  banners, forces HTTPS, and naps idle tabs by itself. Leave the flags page
+  alone.
+- Two extensions worth grabbing from the Chrome store: Bitwarden (passwords)
+  and SponsorBlock (skips sponsor segments in lecture recordings you watch
+  back). uBlock is already built in, don't double up.
