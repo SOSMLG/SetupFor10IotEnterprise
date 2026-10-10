@@ -10,6 +10,8 @@
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File Install-Win10-IoT-21H2.ps1
   powershell -ExecutionPolicy Bypass -File Install-Win10-IoT-21H2.ps1 -IncludeOptional -Unattended
+  powershell -ExecutionPolicy Bypass -File Install-Win10-IoT-21H2.ps1 -TweaksOnly
+  (tweaks-only: just the Titus tweaks on any live machine. no apps, no configs, no debloat.)
 #>
 [CmdletBinding()]
 param(
@@ -19,7 +21,8 @@ param(
   [string]$OfflineDir = '',
   [string]$LogDir = 'C:\Windows\Logs\Win10IoT-Setup',
   [switch]$NoTweaks,
-  [switch]$NoDebloat
+  [switch]$NoDebloat,
+  [switch]$TweaksOnly
 )
 $ErrorActionPreference = 'Continue'
 Set-StrictMode -Version 2
@@ -59,7 +62,8 @@ if (-not $online -and -not $OfflineDir) {
 if (-not $online) { Log 'OFFLINE mode: winget source installs will fail; pre-seeded files still apply.' }
 
 # fresh boot almost never has DHCP yet. wait up to 4 min or winget dies for no reason.
-if (-not $online) {
+# tweaks need no net, so tweaks-only skips the wait entirely.
+if ((-not $online) -and (-not $TweaksOnly)) {
   $waited = 0
   while (-not $online -and $waited -lt 240) {
     Start-Sleep -Seconds 15; $waited += 15
@@ -107,7 +111,7 @@ function Ensure-Winget {
     return $true
   } catch { Log "WARN winget bootstrap failed: $_. Install App Installer manually, then re-run."; return $false }
 }
-$hasWinget = Ensure-Winget
+if (-not $TweaksOnly) { $hasWinget = Ensure-Winget } else { $hasWinget = $false }
 
 # ---------- 1b. runtimes first. apps below need them. ----------
 # ancient vendor tools still link the old redists, so all of them go on.
@@ -121,14 +125,14 @@ $runtimeApps = @(
   'Microsoft.DotNet.DesktopRuntime.8'
 )
 # 3.5 + DirectPlay for old vendor tools. some LTSC trims need install media, hence the warn.
-if ($isAdmin) {
+if ($isAdmin -and (-not $TweaksOnly)) {
   foreach ($f in @('NetFx3','DirectPlay')) {
     # NOTE learned the hard way: native exes don't throw. check the exit code or the log lies.
     DISM /Online /Enable-Feature /FeatureName:$f /All /NoRestart | Out-Null
     if ($LASTEXITCODE -eq 0) { Log "${f}: enabled." }
     else { Log "WARN ${f}: DISM exit=$LASTEXITCODE (may need install media as source) - enable manually for old vendor tools." }
   }
-} else { Log 'WARN NetFx3/DirectPlay: skipped (not admin).' }
+} else { if (-not $TweaksOnly) { Log 'WARN NetFx3/DirectPlay: skipped (not admin).' } }
 # 4.8 is already in the image. moving on.
 $coreApps = @(
   'LGUG2Z.komorebi',
@@ -217,7 +221,7 @@ function Install-OfflineFile($file) {
     }
   }
 }
-if ($hasWinget) {
+if ((-not $TweaksOnly) -and $hasWinget) {
   foreach ($id in ($runtimeApps + $coreApps)) {
     $off = Find-OfflineInstaller $id
     if ($off -and $Unattended) {
@@ -232,7 +236,7 @@ if ($hasWinget) {
   }
   if ($online) { try { winget upgrade --all --silent --accept-source-agreements --accept-package-agreements } catch {} }
   else { Log 'SKIP upgrade (offline).' }
-} else {
+} elseif ($TweaksOnly) { Log 'Tweaks-only: apps skipped.' } else {
   # winget completely absent. whatever is on disk still goes on.
   if ($OfflineDir -and (Test-Path $OfflineDir)) {
     Log 'No winget - installing from -OfflineDir only...'
@@ -255,6 +259,7 @@ try {
 Log 'NOTE manual-only: ExplorerBlurMica (Maplespe releases, optional), Spicetify (after Spotify: Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/spicetify/cli/main/install.ps1 | Invoke-Expression).'
 
 # ---------- 3. configs ----------
+if (-not $TweaksOnly) {
 Log 'Configs...'
 function Copy-Config($src, $dst) {
   New-Item -ItemType Directory -Force -Path (Split-Path $dst) | Out-Null
@@ -340,6 +345,7 @@ if ((Test-Path $fontDir) -and $isAdmin) {
     try { $fFolder.CopyHere($_.FullName, 0x10); Log "  font: $($_.Name)" } catch { Log "  WARN font $($_.Name): $_" }
   }
 } else { Log '  Fonts: drop JetBrainsMono Nerd Font + Monocraft .ttf into Fonts/ and re-run as admin (or right-click Install).' }
+} else { Log 'Configs skipped (tweaks-only).' }
 
 # ---------- 3b. sane defaults. titus-style, but plain reg so it works with no net. ----------
 # win10 updates come as one blob, no security-only split exists.
@@ -356,6 +362,15 @@ if (-not $NoTweaks) {
     # restore point first. tiny10 usually ripped system restore out, so don't hold your breath.
     try { Checkpoint-Computer -Description 'Win10IoT pre-tweaks' -RestorePointType MODIFY_SETTINGS -EA Stop; Log '  restore point created.' }
     catch { Log '  WARN restore point: unavailable (common on tiny10) - continuing.' }
+    # O&O ShutUp10++ next, our reg values after, so ours win any overlap.
+    try {
+      $oosu = Join-Path $Repo 'OOSU\OOSHUTUP10.exe'
+      $oocfg = Join-Path $Repo 'OOSU\ooshutup10.cfg'
+      if ((Test-Path $oosu) -and (Test-Path $oocfg)) {
+        Start-Process $oosu -ArgumentList "`"$oocfg`"", '/quiet' -Wait -EA Stop
+        Log '  O&O ShutUp10++ applied (titus cfg).'
+      } else { Log '  O&O skipped (exe/cfg missing from OOSU/).' }
+    } catch { Log "  WARN O&O: $_" }
     # 0 means security-level. only enterprise SKUs honor it, and this is one.
     Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection' 'AllowTelemetry' 0
     Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection' 'AllowTelemetry' 0
@@ -393,6 +408,25 @@ if (-not $NoTweaks) {
     Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\LocationAndSensors' 'DisableLocation' 1
     # WPBT lets vendor blobs run at boot. off.
     Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' 'DisableWpbtExecution' 1
+    # teredo off. xbox tunneling only, pure attack surface otherwise.
+    netsh interface teredo set state disabled 2>&1 | Out-Null
+    if ($LASTEXITCODE -eq 0) { Log '  teredo off.' } else { Log "  WARN teredo exit=$LASTEXITCODE" }
+    # clock reads RTC as UTC. dual-boot friendly, linux does the same.
+    Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\TimeZoneInformation' 'RealTimeIsUniversal' 1
+    # reserved storage off. small disks need those gigs back.
+    try { Set-WindowsReservedStorageState -State Disabled -EA Stop; Log '  reserved storage off.' }
+    catch { Log "  WARN reserved storage: $_" }
+    # IPv4 preferred, IPv6 stays alive. full disable breaks things, this doesn't.
+    Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters' 'DisabledComponents' 32
+    # cloudflare DNS on every live adapter. dhcp hands the address, we pick the resolver.
+    try {
+      Get-NetAdapter -Physical -EA Stop | Where-Object { $_.Status -eq 'Up' } | ForEach-Object {
+        Set-DnsClientServerAddress -InterfaceIndex $_.ifIndex -ServerAddresses @('1.1.1.1','1.0.0.1') -EA Stop
+      }
+      Log '  DNS: cloudflare on live adapters.'
+    } catch { Log "  WARN DNS: $_" }
+    # notification center gone (toasts die per-user below).
+    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer' 'DisableNotificationCenter' 1
   } else { Log '  machine tweaks need admin. skipped.' }
   # per-user stuff, no admin needed.
   Set-Reg 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\AdvertisingInfo' 'Enabled' 0
@@ -429,6 +463,21 @@ if (-not $NoTweaks) {
   Set-Reg 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize' 'AppsUseLightTheme' 0
   Set-Reg 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize' 'SystemUsesLightTheme' 0
   Set-Reg 'HKCU:\Control Panel\Desktop' 'MenuShowDelay' '100' 'String'
+  # background apps: none. stuff runs when opened, not before.
+  Set-Reg 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications' 'GlobalUserDisabled' 1
+  # quiet box: toast popups off. (notification center itself dies machine-side above.)
+  Set-Reg 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\PushNotifications' 'ToastEnabled' 0
+  # looks fast: best-performance preset, but keep ClearType or fonts turn to mush.
+  Set-Reg 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects' 'VisualFXSetting' 2
+  Set-Reg 'HKCU:\Control Panel\Desktop' 'FontSmoothing' '2' 'String'
+  Set-Reg 'HKCU:\Control Panel\Desktop' 'FontSmoothingType' 2
+  # storage sense off. this box is managed by hand.
+  Set-Reg 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\StorageSense\Parameters\StoragePolicy' '01' 0
+  # no AI leftovers: inking + typing personalization off. copilot and recall
+  # don't exist on 21H2. opencode isn't windows, it stays.
+  Set-Reg 'HKCU:\SOFTWARE\Microsoft\InputPersonalization' 'RestrictImplicitInkCollection' 1
+  Set-Reg 'HKCU:\SOFTWARE\Microsoft\InputPersonalization' 'RestrictImplicitTextCollection' 1
+  Set-Reg 'HKCU:\SOFTWARE\Microsoft\InputPersonalization' 'AllowInputPersonalization' 0
   # trash out temp.
   try {
     Remove-Item (Join-Path $env:TEMP '*') -Recurse -Force -EA SilentlyContinue
@@ -452,7 +501,7 @@ if (-not $NoTweaks) {
 
 # ---------- 3c. rip out what helium/vlc/vscodium already replace ----------
 # checks state first. on tiny10 half of this is already gone, it just says so and moves on.
-if (-not $NoDebloat) {
+if ((-not $NoDebloat) -and (-not $TweaksOnly)) {
   Log 'Ripping out the replaced stuff...'
   if (-not $isAdmin) { Log '  skipped (not admin).' }
   else {
@@ -487,10 +536,18 @@ if (-not $NoDebloat) {
       if ($wp.State -ne 'NotPresent') { Remove-WindowsCapability -Online -Name 'Microsoft.Windows.WordPad~~~~0.0.1.0' -EA Stop | Out-Null; Log '  WordPad removed.' }
       else { Log '  WordPad already gone.' }
     } catch { Log "  WARN WordPad: $_" }
+    # OneDrive. nothing here replaces sync, but nobody asked for it either. out.
+    try {
+      $od = "$env:SystemRoot\SysWOW64\OneDriveSetup.exe"
+      if (-not (Test-Path $od)) { $od = "$env:SystemRoot\System32\OneDriveSetup.exe" }
+      if (Test-Path $od) { Start-Process $od -ArgumentList '/uninstall' -Wait -EA Stop; Log '  OneDrive removed.' }
+      else { Log '  OneDrive already gone.' }
+    } catch { Log "  WARN OneDrive: $_" }
   }
-} else { Log 'Debloat skipped (-NoDebloat).' }
+} else { if ($TweaksOnly) { Log 'Tweaks-only: debloat skipped.' } else { Log 'Debloat skipped (-NoDebloat).' } }
 
 # ---------- 4. autostart Komorebi + whkd (user logon), stock panel untouched ----------
+if (-not $TweaksOnly) {
 Log 'Autostart...'
 function Set-StartupShortcut($name, $target, $args) {
   $sm = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup'
@@ -534,12 +591,16 @@ try {
   Set-Content -Path $finishPath -Value $finishCmd -Encoding Ascii -Force -EA Stop
   Log "  finish helper: $finishPath"
 } catch { Log "  WARN finish helper: $_" }
+} else { Log 'Autostart/browser/finish skipped (tweaks-only).' }
 
 Log '---'
-if ($failed.Count) { Log ('FAILED/RETRY: ' + ($failed -join ', ')) } else { Log 'All winget installs reported ok.' }
+if ($TweaksOnly) { if ($failed.Count) { Log ('FAILED/RETRY: ' + ($failed -join ', ')) } }
+elseif ($failed.Count) { Log ('FAILED/RETRY: ' + ($failed -join ', ')) } else { Log 'All winget installs reported ok.' }
 Log "Log: $LogFile"
+if (-not $TweaksOnly) {
 Log 'NEXT:'
 Log '  1. reboot, Komorebi + whkd autostart, stock taskbar as-is.'
 Log '  2. double-click Desktop Win10IoT-Finish.cmd (opencode auth + optional password).'
 Log '  3. MATLAB via campus license + USB-serial drivers (CH340/CP210x/ST-Link) manually.'
+} else { Log 'Tweaks-only done. reboot to feel the taskbar changes.' }
 Stop-Transcript | Out-Null
