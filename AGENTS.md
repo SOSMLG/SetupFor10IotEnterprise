@@ -2,7 +2,7 @@
 
 ## What this is
 Slim Win10 IoT 21H2 (19044) setup: PowerShell base, Komorebi + whkd,
-Helium, VSCodium, stock taskbar. Red and black theme everywhere.
+Helium, VSCodium, stock taskbar. Stock colors everywhere.
 Unattended installer: `Install-Win10-IoT-21H2.ps1` (`-TweaksOnly` for
 tweaks-only runs). Custom ISO recipe in `ISO/README-ISO.md`.
 

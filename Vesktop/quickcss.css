@@ -1,19 +1,2 @@
-/* Red & black cozy QuickCSS for Vesktop.
-   Enable: Vesktop Settings > Vencord > QuickCSS > Enable.
-   Deployed by installer to %APPDATA%\Vesktop\settings\quickcss.css (fresh only). */
-:root {
-  --rb-bg: #0b0b0d;
-  --rb-panel: #141216;
-  --rb-red: #e5484d;
-  --rb-deep: #8b1113;
-  --rb-text: #f3e9e9;
-  --rb-muted: #a89797;
-  --background-primary: var(--rb-bg) !important;
-  --background-secondary: var(--rb-panel) !important;
-  --background-tertiary: var(--rb-bg) !important;
-  --background-floating: var(--rb-panel) !important;
-  --text-normal: var(--rb-text) !important;
-  --text-muted: var(--rb-muted) !important;
-  --brand-500: var(--rb-red) !important;
-  --brand-560: var(--rb-deep) !important;
-}
+/* QuickCSS placeholder. Stock Vesktop look.
+   Add your own rules below if you want them. */

@@ -10,13 +10,6 @@
   "border_style": "System",
   "border_width": 3,
   "border_offset": 0,
-  "border_colours": {
-    "single": "#e5484d",
-    "stack": "#8b1113",
-    "floating": "#8b1113",
-    "monocle": "#e5484d",
-    "unfocused": "#2a2a2e"
-  },
   "mouse_follows_focus": false,
   "transparency": true,
   "transparency_alpha": 250,
@@ -28,11 +21,6 @@
       "movement": "EaseOutBack",
       "transparency": "Linear"
     }
-  },
-  "theme": {
-    "palette": "Catppuccin",
-    "name": "Mocha",
-    "accent": "Mocha"
   },
   "stackbar": {
     "height": 24,

@@ -3,8 +3,6 @@
   "minimizeToTray": true,
   "discordBranch": "stable",
   "arRPC": true,
-  "splashColor": "#e5484d",
-  "splashBackground": "#0b0b0d",
   "autoUpdate": true,
   "autoUpdateNotification": true,
   "useQuickCss": true,
