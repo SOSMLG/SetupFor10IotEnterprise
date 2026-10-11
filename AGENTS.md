@@ -2,7 +2,7 @@
 
 ## What this is
 Slim Win10 IoT 21H2 (19044) setup: PowerShell base, Komorebi + whkd,
-Helium, VSCodium, stock taskbar. Stock colors everywhere.
+Helium, VSCodium, stock taskbar. Dark mode on, everything else stock.
 Unattended installer: `Install-Win10-IoT-21H2.ps1` (`-TweaksOnly` for
 tweaks-only runs). Custom ISO recipe in `ISO/README-ISO.md`.
 
@@ -35,6 +35,9 @@ tweaks-only runs). Custom ISO recipe in `ISO/README-ISO.md`.
   Runs `/quiet` before our reg values so ours win overlaps.
 - `ISO/`: FirstLogon.cmd, Get-Offline.ps1 (keep its ID list in sync with
   the installer's), Offline/ cache (gitignored), build/ working copy
-  (gitignored), merged autounattend.xml (ThisPc admin + FirstLogon).
+  (gitignored), merged autounattend.xml (My Pc admin + FirstLogon).
+  `ventoy/script/Win10IoT-unattended.xml` is a copy of it, change one,
+  change both. `-BakeToWim` puts the same payload inside install.wim
+  for ventoy (which skips $OEM$); rufus path stays live via $OEM$.
 - `.gitignore` excludes `*.iso`, `ISO/build/`, `ISO/Offline/`. No secrets
   in the tree: blank passwords, empty API keys.

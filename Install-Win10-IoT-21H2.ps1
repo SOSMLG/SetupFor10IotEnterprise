@@ -82,21 +82,22 @@ $online = $false
 try { $online = Test-Connection -ComputerName 8.8.8.8 -Count 1 -Quiet -EA Stop } catch {}
 if (-not $online -and -not $OfflineDir) {
   Log 'WARN: no network detected and no -OfflineDir given.'
-  Log '  Either connect, or seed ISO/Offline via Get-Offline.ps1 on an online PC'
+  Log '  plug phone in for usb tethering, or seed ISO/Offline via Get-Offline.ps1 on an online PC'
   Log "  and re-run with: -OfflineDir '<path-to-Offline>' -Unattended"
 }
 if (-not $online) { Log 'OFFLINE mode: online engines skipped; pre-seeded files still apply.' }
 
-# fresh boot almost never has DHCP yet. wait up to 4 min or winget dies for no reason.
+# fresh boot almost never has DHCP yet. usb tethering takes a few min to enable,
+# so wait up to 10 min or winget dies for no reason.
 # tweaks need no net, so tweaks-only skips the wait entirely.
 if ((-not $online) -and (-not $TweaksOnly)) {
   $waited = 0
-  while (-not $online -and $waited -lt 240) {
+  while (-not $online -and $waited -lt 600) {
     Start-Sleep -Seconds 15; $waited += 15
     try { $online = Test-Connection -ComputerName 8.8.8.8 -Count 1 -Quiet -EA Stop } catch {}
   }
   if ($online) { Log "network up after ${waited}s." }
-  else { Log 'WARN: still offline after 4 min - continuing with pre-seeded files only.' }
+  else { Log 'WARN: still offline after 10 min - continuing with pre-seeded files only.' }
 }
 
 # ---------- 0. repairs. opt-in only (-Fixes), runs before everything. ----------
@@ -173,6 +174,15 @@ if (-not $NoTweaks) {
         if (Get-Service $svc -EA SilentlyContinue) { Set-Service $svc -StartupType Manual -EA Stop; Log "  svc manual: $svc" }
       } catch { Log "  WARN svc ${svc}: $_" }
     }
+    # bluescreens say what actually broke. two keys, zero cost.
+    Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl' 'DisplayParameters' 1
+    Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl' 'DisableEmoticon' 1
+    # svchost split matched to ram. fewer idle processes hanging around.
+    try {
+      $memKB = (Get-CimInstance Win32_PhysicalMemory -EA Stop | Measure-Object Capacity -Sum).Sum / 1KB
+      Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control' -Name 'SvcHostSplitThresholdInKB' -Value ([uint32]$memKB) -EA Stop
+      Log '  svchost split matched to ram.'
+    } catch { Log "  WARN svchost split: $_" }
     # tell-me-first updates, no reboot while logged in, and windows keeps its hands off my drivers.
     Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' 'AUOptions' 2
     Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' 'NoAutoRebootWithLoggedOnUsers' 1
@@ -283,6 +293,15 @@ if (-not $NoTweaks) {
         Set-MpPreference -DisableRealtimeMonitoring $false -EA Stop; Log '  defender realtime on.'
       } else { Log '  defender absent on this trim. skipped.' }
     } catch { Log "  WARN defender: $_" }
+    # defender skips the lab folders that exist. less rescanning big toolchains.
+    # more later by hand: Add-MpPreference -ExclusionPath <dir>.
+    try {
+      if (Get-Command Add-MpPreference -EA SilentlyContinue) {
+        foreach ($ex in @('C:\Setup', "$env:ProgramFiles\MATLAB")) {
+          if (Test-Path $ex) { Add-MpPreference -ExclusionPath $ex -EA Stop; Log "  defender exclusion: $ex" }
+        }
+      }
+    } catch { Log "  WARN defender exclusions: $_" }
   } else { Log '  machine tweaks need admin. skipped.' }
   # per-user stuff, no admin needed.
   Set-Reg 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\AdvertisingInfo' 'Enabled' 0
@@ -353,6 +372,12 @@ if (-not $NoTweaks) {
   Set-Reg 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications' 'GlobalUserDisabled' 1
   # quiet box: toast popups off. (notification center itself dies machine-side above.)
   Set-Reg 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\PushNotifications' 'ToastEnabled' 0
+  # dark mode, easier on the eyes. taskbar + apps go dark.
+  Set-Reg 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize' 'AppsUseLightTheme' 0
+  Set-Reg 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize' 'SystemUsesLightTheme' 0
+  # world formats, not us. dates and numbers stay unambiguous on shared docs.
+  try { Set-Culture 'en-001' -EA Stop; Log '  formats: en-001 (world).' }
+  catch { Log "  WARN formats: $_" }
   # looks fast: best-performance preset, but keep ClearType or fonts turn to mush.
   Set-Reg 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects' 'VisualFXSetting' 2
   Set-Reg 'HKCU:\Control Panel\Desktop' 'FontSmoothing' '2' 'String'
@@ -1009,7 +1034,7 @@ try {
   $finishCmd = '@echo off' + "`r`n" + 'title Win10IoT finish setup' + "`r`n" +
     'powershell -NoProfile -ExecutionPolicy Bypass -Command "opencode auth login"' + "`r`n" +
     'echo.' + "`r`n" + 'echo Set a password now if you want one (Enter twice to stay blank):' + "`r`n" +
-    'net user ThisPc *' + "`r`n" +
+    'net user "My Pc" *' + "`r`n" +
     'echo.' + "`r`n" + 'echo Delete this shortcut when finished.' + "`r`n" + 'pause'
   $finishPath = Join-Path ([Environment]::GetFolderPath('CommonDesktopDirectory')) 'Win10IoT-Finish.cmd'
   Set-Content -Path $finishPath -Value $finishCmd -Encoding Ascii -Force -EA Stop

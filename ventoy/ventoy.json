@@ -1,0 +1,9 @@
+{
+    "auto_install": [
+        {
+            "image": "/Win10IoT-21H2-*.iso",
+            "template": "/ventoy/script/Win10IoT-unattended.xml",
+            "autosel": 1
+        }
+    ]
+}
