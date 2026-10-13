@@ -1,0 +1,10 @@
+{
+  "username": "My Pc",
+  "arch": "amd64",
+  "locales": {
+    "input": "0409:00000409",
+    "system": "en-US",
+    "ui": "en-US",
+    "user": "en-001"
+  }
+}

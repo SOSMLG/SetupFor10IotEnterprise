@@ -5,7 +5,7 @@ rufus path needs nothing. ventoy skips $OEM$, so it needs this folder.
 ## use
 1. copy the built iso anywhere on the ventoy stick.
 2. copy this `ventoy` folder to the stick root (stick ends up with
-   `/ventoy/ventoy.json` and `/ventoy/script/Win10IoT-unattended.xml`).
+   `/ventoy/ventoy.json` and `/ventoy/script/Win-Iot-unattended.xml`).
 3. boot the iso. install runs unattended, no menu.
 
 ## notes

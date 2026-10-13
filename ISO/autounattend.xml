@@ -47,7 +47,7 @@
             <FirstLogonCommands>
                 <SynchronousCommand wcm:action="add">
                     <CommandLine>powershell -NoProfile -ExecutionPolicy Bypass -File "C:\Setup\ISO\FirstBoot.ps1"</CommandLine>
-                    <Description>Win10IoT apps + tweaks (choco + github + staged gaps)</Description>
+                    <Description>Win-Iot apps + tweaks (choco + github + staged gaps)</Description>
                     <Order>1</Order>
                 </SynchronousCommand>
             </FirstLogonCommands>

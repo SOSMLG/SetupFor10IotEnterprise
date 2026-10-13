@@ -11,7 +11,7 @@
   Assumes the single-image layout the current iso has (index 1).
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File ISO\Build-Iso.ps1
-  powershell -ExecutionPolicy Bypass -File ISO\Build-Iso.ps1 -ReuseBuild -OutIso D:\Win10IoT.iso
+  powershell -ExecutionPolicy Bypass -File ISO\Build-Iso.ps1 -ReuseBuild -OutIso D:\Win-Iot.iso
   powershell -ExecutionPolicy Bypass -File ISO\Build-Iso.ps1 -BakeToWim
 #>
 param(
@@ -19,10 +19,11 @@ param(
   [string]$WorkDir = '',
   [string]$OfflineDir = '',
   [string]$OutIso = '',
-  [string]$Label = 'WIN10IOT',
+  [string]$Label = 'WIN-IOT',
   [string]$OscdimgPath = '',
   [switch]$ReuseBuild,
-  [switch]$BakeToWim
+  [switch]$BakeToWim,
+  [switch]$SkipTemplateGen
 )
 $ErrorActionPreference = 'Continue'
 function Log($m) { Write-Host $m }
@@ -31,7 +32,7 @@ $Repo = Split-Path $ScriptDir -Parent
 if (-not $IsoPath) { $IsoPath = Join-Path $ScriptDir 'iotenterprise10.iso' }
 if (-not $WorkDir) { $WorkDir = Join-Path $ScriptDir 'build' }
 if (-not $OfflineDir) { $OfflineDir = Join-Path $ScriptDir 'Offline' }
-if (-not $OutIso) { $OutIso = Join-Path $ScriptDir ('Win10IoT-21H2-' + (Get-Date -Format 'yyyyMMdd') + '.iso') }
+if (-not $OutIso) { $OutIso = Join-Path $ScriptDir ('Win-Iot-' + (Get-Date -Format 'yyyyMMdd') + '.iso') }
 
 # fail fast on tools. no point extracting 4.5GB then discovering oscdimg is missing.
 if (-not (Get-Command 7z -EA SilentlyContinue)) { Log 'need 7z (choco install 7zip). stop.'; exit 1 }
@@ -72,13 +73,33 @@ if (Test-Path $OfflineDir) {
 } else { Log 'no ISO\Offline. online engines cover all but helium + pre-2015 redists.' }
 
 $merge = Join-Path $ScriptDir 'autounattend.xml'
+# build-time regeneration: if the template + config are present, render the
+# answer file from them so the swapped-in copy can never drift from source.
+$tpl = Join-Path $Repo 'templates\autounattend.xml.tpl'
+$cfgPath = Join-Path $Repo 'templates\build-config.json'
+if ((Test-Path $tpl) -and (-not $SkipTemplateGen)) {
+  try {
+    $cfg = $null
+    if (Test-Path $cfgPath) { $cfg = Get-Content $cfgPath -Raw | ConvertFrom-Json }
+    $userName = if ($cfg -and $cfg.username) { $cfg.username } else { 'My Pc' }
+    $arch = if ($cfg -and $cfg.arch) { $cfg.arch } else { 'amd64' }
+    $inLoc = if ($cfg -and $cfg.locales.input) { $cfg.locales.input } else { '0409:00000409' }
+    $sysLoc = if ($cfg -and $cfg.locales.system) { $cfg.locales.system } else { 'en-US' }
+    $uiLoc = if ($cfg -and $cfg.locales.ui) { $cfg.locales.ui } else { 'en-US' }
+    $userLoc = if ($cfg -and $cfg.locales.user) { $cfg.locales.user } else { 'en-001' }
+    $body = Get-Content $tpl -Raw
+    $body = $body.Replace('{{ARCH}}', $arch).Replace('{{USERNAME}}', $userName).Replace('{{INPUT_LOCALE}}', $inLoc).Replace('{{SYSTEM_LOCALE}}', $sysLoc).Replace('{{UILANGUAGE}}', $uiLoc).Replace('{{USERLOCALE}}', $userLoc)
+    if ($body -notmatch '<unattend') { Log '  WARN template render looks wrong, keeping existing autounattend.xml.' }
+    else { Set-Content -Path $merge -Value $body -Encoding UTF8 -EA Stop; Log '  autounattend.xml regenerated from template.' }
+  } catch { Log "  WARN template gen: $_" }
+}
 if (Test-Path $merge) {
   Copy-Item $merge (Join-Path $WorkDir 'autounattend.xml') -Force -EA Stop
   Log '  merged autounattend in.'
 } else { Log '  WARN no ISO\autounattend.xml, keeping the tiny10 one.' }
 
 # ventoy template is a copy of the answer file. catch drift now, not on the stick.
-$vtxn = Join-Path $Repo 'ventoy\script\Win10IoT-unattended.xml'
+$vtxn = Join-Path $Repo 'ventoy\script\Win-Iot-unattended.xml'
 if ((Test-Path $merge) -and (Test-Path $vtxn)) {
   $a = (Get-Content $merge -Raw -EA SilentlyContinue); $b = (Get-Content $vtxn -Raw -EA SilentlyContinue)
   if ($a -and $b -and ($a -ne $b)) { Log '  WARN ventoy template differs from ISO/autounattend.xml. copy it over.' }

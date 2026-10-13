@@ -1,4 +1,4 @@
-# Win10 IoT Enterprise 21H2 base profile (PS 5.1, stock console)
+# Win10/Win11 IoT LTSC base profile (PS 5.1, stock console)
 try {
     [Console]::InputEncoding  = [System.Text.Encoding]::UTF8
     [Console]::OutputEncoding = [System.Text.Encoding]::UTF8

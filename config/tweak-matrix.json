@@ -1,0 +1,7 @@
+{
+  "tweaks": [
+    {"name": "Telemetry0", "enabled": true},
+    {"name": "DiagTrackDisabled", "enabled": true},
+    {"name": "LocationOff", "enabled": true}
+  ]
+}

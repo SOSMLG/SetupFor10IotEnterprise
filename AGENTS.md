@@ -1,9 +1,9 @@
 # AGENTS.md - notes for any coding agent working in this folder
 
 ## What this is
-Slim Win10 IoT 21H2 (19044) setup: PowerShell base, Komorebi + whkd,
+Slim Win10/Win11 IoT LTSC setup: PowerShell base, Komorebi + whkd,
 Helium, VSCodium, stock taskbar. Dark mode on, everything else stock.
-Unattended installer: `Install-Win10-IoT-21H2.ps1` (`-TweaksOnly` for
+Unattended installer: `install-Win-Iot.ps1` (`-TweaksOnly` for
 tweaks-only runs). Custom ISO recipe in `ISO/README-ISO.md`.
 
 ## Rules learned the hard way
@@ -26,7 +26,7 @@ tweaks-only runs). Custom ISO recipe in `ISO/README-ISO.md`.
 - Voice: comments and logs read like one tired human. Short, lowercase
   asides, no em-dashes, no buzzwords, no triplets. Never "improve" wording
   in a way that touches logic. Run `check_balance.py` after every edit:
-  `python3 <temp>/check_balance.py Install-Win10-IoT-21H2.ps1`.
+  `python3 <temp>/check_balance.py install-Win-Iot.ps1`.
 
 ## Layout
 - Per-app folders hold a config + short README. Fresh-install only deploys
@@ -36,7 +36,7 @@ tweaks-only runs). Custom ISO recipe in `ISO/README-ISO.md`.
 - `ISO/`: FirstLogon.cmd, Get-Offline.ps1 (keep its ID list in sync with
   the installer's), Offline/ cache (gitignored), build/ working copy
   (gitignored), merged autounattend.xml (My Pc admin + FirstLogon).
-  `ventoy/script/Win10IoT-unattended.xml` is a copy of it, change one,
+  `ventoy/script/Win-Iot-unattended.xml` is a copy of it, change one,
   change both. `-BakeToWim` puts the same payload inside install.wim
   for ventoy (which skips $OEM$); rufus path stays live via $OEM$.
 - `.gitignore` excludes `*.iso`, `ISO/build/`, `ISO/Offline/`. No secrets

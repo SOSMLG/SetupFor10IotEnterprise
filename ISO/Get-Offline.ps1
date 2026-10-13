@@ -2,7 +2,7 @@
 .SYNOPSIS
   Seed ISO/Offline on an ONLINE pc with winget. Not on the stripped box.
 .DESCRIPTION
-  One subfolder per winget id, same names Install-Win10-IoT-21H2.ps1 expects.
+  One subfolder per winget id, same names install-Win-Iot.ps1 expects.
   Copy the Offline folder into the ISO (or USB) next to FirstLogon.cmd.
   Keep the id list in sync with the installer. yep, by hand.
 .EXAMPLE
@@ -19,7 +19,7 @@ param(
   [switch]$GapsOnly
 )
 $ErrorActionPreference = 'Continue'
-# same list as Install-Win10-IoT-21H2.ps1 $runtimeApps. change one, change both.
+# same list as install-Win-Iot.ps1 $runtimeApps. change one, change both.
 $runtimeApps = @(
   'Microsoft.VCRedist.2005.x86','Microsoft.VCRedist.2005.x64',
   'Microsoft.VCRedist.2008.x86','Microsoft.VCRedist.2008.x64',
@@ -29,7 +29,7 @@ $runtimeApps = @(
   'Microsoft.VCRedist.2015+.x86','Microsoft.VCRedist.2015+.x64',
   'Microsoft.DotNet.DesktopRuntime.8'
 )
-# same list as Install-Win10-IoT-21H2.ps1 $coreApps. change one, change both.
+# same list as install-Win-Iot.ps1 $coreApps. change one, change both.
 $coreApps = @(
   'LGUG2Z.komorebi',
   'LGUG2Z.whkd',
@@ -55,15 +55,32 @@ $ids = if ($GapsOnly) { $runtimeApps + $gapIds } else { $runtimeApps + $coreApps
 if (-not (Get-Command winget -EA SilentlyContinue)) { Write-Host 'winget missing here. run this on a normal online pc, not the stripped box.'; exit 1 }
 New-Item -ItemType Directory -Force -Path $OfflineDir | Out-Null
 $failed = @()
+$manifest = @()
 foreach ($id in $ids) {
   $sub = Join-Path $OfflineDir ($id -replace '[^A-Za-z0-9]+','_')
   New-Item -ItemType Directory -Force -Path $sub | Out-Null
   Write-Host "fetch: $id"
   # exact-id download so filenames keep the tech tag (_wix_/_inno_/_nullsoft_/_burn_/_exe_). installer reads that for silent flags.
   winget download --id $id -e -d $sub --accept-source-agreements --accept-package-agreements
-  if ($LASTEXITCODE -ne 0) { Write-Host "  WARN exit=$LASTEXITCODE"; $failed += $id }
-  else { Write-Host '  ok' }
+  if ($LASTEXITCODE -ne 0) { Write-Host "  WARN exit=$LASTEXITCODE"; $failed += $id; continue }
+  Write-Host '  ok'
+  foreach ($f in (Get-ChildItem -Path $sub -File -ErrorAction SilentlyContinue)) {
+    $hash = ''
+    try { $hash = (Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256 -ErrorAction Stop).Hash } catch {}
+    $manifest += [PSCustomObject]@{
+      id       = $id
+      file     = $f.Name
+      relpath  = ($sub.Substring($OfflineDir.Length).TrimStart('\')) + '\' + $f.Name
+      size     = $f.Length
+      sha256   = $hash
+    }
+  }
 }
+$manifestPath = Join-Path $OfflineDir 'manifest.json'
+try {
+  ConvertTo-Json -InputObject @($manifest) -Depth 5 | Set-Content -Path $manifestPath -Encoding UTF8
+  Write-Host "manifest: $manifestPath ($($manifest.Count) files)"
+} catch { Write-Host "WARN could not write manifest: $($_.Exception.Message)" }
 Write-Host '---'
 if ($failed.Count) { Write-Host ('RETRY: ' + ($failed -join ', ')) }
 else { Write-Host 'all fetched.' }

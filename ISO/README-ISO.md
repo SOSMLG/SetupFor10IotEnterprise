@@ -47,7 +47,7 @@ first boot: auto-logon as My Pc, `C:\Setup\ISO\FirstLogon.cmd` installs apps
 (choco + github, staged gaps), tweaks, configs, autostart. nic driver is
 usually missing here, so plug the phone in and turn on usb tethering when
 the log asks. installer waits up to 10 min for it. reboot when the log
-says so, then double-click `Win10IoT-Finish.cmd` on the desktop.
+says so, then double-click `Win-Iot-Finish.cmd` on the desktop.
 
 ## notes
 - account is `My Pc` with a space. profile lands at `C:\Users\My Pc`.

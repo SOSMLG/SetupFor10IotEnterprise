@@ -1,0 +1,19 @@
+{
+  "dns": {
+    "provider": "Cloudflare",
+    "auto": true
+  },
+  "adblock": {
+    "adguard": false,
+    "nextdns": false
+  },
+  "tweaks": {
+    "matrix": []
+  },
+  "hash": {
+    "verify": true
+  },
+  "iso": {
+    "regenerateAutounattend": true
+  }
+}
