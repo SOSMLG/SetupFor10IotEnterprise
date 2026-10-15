@@ -4,7 +4,9 @@
 Slim Win10/Win11 IoT LTSC setup: PowerShell base, Komorebi + whkd,
 Helium, VSCodium, stock taskbar. Dark mode on, everything else stock.
 Unattended installer: `install-Win-Iot.ps1` (`-TweaksOnly` for
-tweaks-only runs). Custom ISO recipe in `ISO/README-ISO.md`.
+tweaks-only runs). Custom ISO recipe in `ISO/README-ISO.md`. Taste port
+from the sibling linux project `..\XfceMlg` (VSCodium theme, Vesktop
+quickcss, shell pack, battery manners).
 
 ## Rules learned the hard way
 - Komorebi `border_colours` is British spelling. `boarder_*` was a real
@@ -25,12 +27,40 @@ tweaks-only runs). Custom ISO recipe in `ISO/README-ISO.md`.
   plugin names verified against vencord.dev/plugins.
 - Voice: comments and logs read like one tired human. Short, lowercase
   asides, no em-dashes, no buzzwords, no triplets. Never "improve" wording
-  in a way that touches logic. Run `check_balance.py` after every edit:
-  `python3 <temp>/check_balance.py install-Win-Iot.ps1`.
+  in a way that touches logic. Run the tests after every edit:
+  `powershell -File tests\run-all.ps1` (syntax, json, module smoke,
+  installer smoke; PSScriptAnalyzer reported when installed).
+- New switches stay additive: `-DryRun`, `-Verify`, `-Only`, `-SkipApps`
+  all default off and guard every write site. When adding a write, add a
+  dry-run log line for it. `Complete-Phase` never marks done in dry-run;
+  the log + report json still get written (that is the dry-run deliverable).
+- Autounattend parity is a test now: `ISO/autounattend.xml` must match
+  `ventoy/script/Win-Iot-unattended.xml` ignoring comments. Edit both.
+- ThinkPad charge cap: lenovo-only, gated on the PWRMGRV key or the
+  IBMPMDRV service, so non-lenovo machines just log a skip. The exe comes
+  from lenovo's cdn, is sha256-pinned in `config/hashes.json` (refresh the
+  pin when lenovo ships a new build) and signature-checked, never bundled.
+  `-SkipBatteryCap` opts out. "already capped" only counts on a positive ON
+  from the exe; anything unparsed gets the cap set. The ChargeStart/Stop reg
+  fallback mirrors a known driver bug that makes a fresh threshold read back
+  OFF, don't delete it.
+- Vesktop quickcss upgrades only when the file is untouched (exact old
+  placeholder, whitespace/BOM-insensitive) or empty. Anyone who added rules
+  under the old marker keeps their file. `Test-QuickcssStale` owns the rule,
+  in the installer and in the smoke test.
+- Shell profile hooks (starship/zoxide/eza/fzf) are all `Get-Command`
+  guarded, and fastfetch only fires on an interactive console with output
+  not redirected. Drop that guard and installs + tests drown in fastfetch.
+- VSCodium folder extensions need the `publisher.name-version` folder name
+  matching package.json, or codium acts like the theme is not installed.
+- PS 5.1 quirk: `@(ConvertFrom-Json ...)` nests the array. assign first,
+  wrap after. bit the smoke test once.
 
 ## Layout
 - Per-app folders hold a config + short README. Fresh-install only deploys
   (`Copy-Fresh`), never overwrite a lived-in config.
+- `Setup.cmd` at the root: one-click, self-elevating wrapper. runs the
+  installer with `-Unattended -IncludeStudy`, extra flags pass through.
 - `OOSU/` bundles O&O ShutUp10++ + titus cfg (85MB, checksum-verified).
   Runs `/quiet` before our reg values so ours win overlaps.
 - `ISO/`: FirstLogon.cmd, Get-Offline.ps1 (keep its ID list in sync with

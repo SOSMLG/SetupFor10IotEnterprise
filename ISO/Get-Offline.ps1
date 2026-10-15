@@ -8,11 +8,12 @@
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File Get-Offline.ps1
   powershell -ExecutionPolicy Bypass -File Get-Offline.ps1 -OfflineDir D:\Offline -IncludeOptional
-  powershell -ExecutionPolicy Bypass -File Get-Offline.ps1 -GapsOnly
+  powershell -ExecutionPolicy Bypass -File Get-Offline.ps1 -OfflineDir D:\Offline -IncludeStudy -GapsOnly
 #>
 param(
   [string]$OfflineDir = (Join-Path $PSScriptRoot 'Offline'),
   [switch]$IncludeOptional,
+  [switch]$IncludeStudy,
   # minimal staging for an online stripped box: github covers komorebi/whkd/vesktop
   # now, choco covers the mainstream. only helium + runtimes still need files.
   # full seed for offline boxes.
@@ -47,10 +48,23 @@ $coreApps = @(
   'WiresharkFoundation.Wireshark',
   'SST.opencode'
 )
-if ($IncludeOptional) { $coreApps += @('Obsidian.Obsidian','Spotify.Spotify') }
+# same list as install-Win-Iot.ps1 $shellApps. change one, change both.
+$shellIds = @('Starship.Starship','ajeetdsouza.zoxide','junegunn.fzf','sharkdp.bat','eza-community.eza','Fastfetch-cli.Fastfetch')
+$coreApps += $shellIds
+$optionalIds = @('Obsidian.Obsidian','Spotify.Spotify')
+if ($IncludeOptional) { $coreApps += $optionalIds }
+# same list as install-Win-Iot.ps1 $studyApps. change one, change both.
+# (installer gates WindowsTerminal on build >= 18362; staging it anyway is fine)
+$studyIds = @('DigitalScholar.Zotero','SumatraPDF.SumatraPDF','MiKTeX.MiKTeX','Typst.Typst','Microsoft.WindowsTerminal')
+if ($IncludeStudy) { $coreApps += $studyIds }
 # github + choco cover everything else online (see $gitMap/$chocoMap in the installer).
 $gapIds = @('ImputNet.Helium')
-$ids = if ($GapsOnly) { $runtimeApps + $gapIds } else { $runtimeApps + $coreApps }
+# gaps-only still stages whatever the include switches asked for: those apps have
+# no online fallback on the target box, so leaving them out of the seed is a trap.
+$extras = @()
+if ($IncludeOptional) { $extras += $optionalIds }
+if ($IncludeStudy) { $extras += $studyIds }
+$ids = if ($GapsOnly) { $runtimeApps + $gapIds + $extras } else { $runtimeApps + $coreApps }
 
 if (-not (Get-Command winget -EA SilentlyContinue)) { Write-Host 'winget missing here. run this on a normal online pc, not the stripped box.'; exit 1 }
 New-Item -ItemType Directory -Force -Path $OfflineDir | Out-Null

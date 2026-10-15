@@ -1,4 +1,5 @@
 {
+    "workbench.colorTheme": "Darkmatter",
     "editor.cursorBlinking": "phase",
     "editor.cursorSmoothCaretAnimation": "on",
     "animations.Install-Method": "Custom UI Style",
@@ -48,5 +49,11 @@
     "workbench.sideBar.location": "right",
     "window.menuBarVisibility": "compact",
     "window.commandCenter": false,
-    "settingsSync.ignoredSettings": []
+    "settingsSync.ignoredSettings": [],
+    "latex-workshop.view.pdf.viewer": "external",
+    "latex-workshop.view.pdf.external.viewer.command": "C:/Users/My Pc/AppData/Local/SumatraPDF/SumatraPDF.exe",
+    "latex-workshop.view.pdf.external.viewer.args": ["%PDF%"],
+    "latex-workshop.view.pdf.external.synctex.command": "C:/Users/My Pc/AppData/Local/SumatraPDF/SumatraPDF.exe",
+    "latex-workshop.view.pdf.external.synctex.args": ["-forward-search", "%TEX%", "%LINE%", "%PDF%"],
+    "tinymist.exportPdf": "onSave"
 }

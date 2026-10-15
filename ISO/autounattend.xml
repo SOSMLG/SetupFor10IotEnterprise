@@ -1,10 +1,7 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <!--
-  merged autounattend for iotenterprise10.iso. tiny10-maker base kept as-is
-  (windowsPE auto-picks image 1, compact install, no dynamic update),
-  plus: My Pc admin account, one auto-logon, first-boot hook.
-  OOBE screens were already skipped in the base file.
-  lands at the ISO root next to setup.exe. build script swaps it in.
+  Autounattend template generated from autounattend.xml logic.
+  Build-time regeneration: replace placeholders {{...}} as needed.
 -->
 <unattend xmlns="urn:schemas-microsoft-com:unattend">
     <settings pass="oobeSystem">
@@ -12,7 +9,6 @@
             <InputLocale>0409:00000409</InputLocale>
             <SystemLocale>en-US</SystemLocale>
             <UILanguage>en-US</UILanguage>
-            <!-- world formats by default. ui stays en-us, the only language in the image. -->
             <UserLocale>en-001</UserLocale>
         </component>
         <component xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
@@ -90,3 +86,4 @@
         </component>
     </settings>
 </unattend>
+

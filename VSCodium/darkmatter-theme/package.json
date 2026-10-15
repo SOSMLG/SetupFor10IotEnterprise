@@ -1,0 +1,22 @@
+{
+  "name": "darkmatter-theme",
+  "displayName": "Darkmatter",
+  "description": "Darkmatter color theme for VSCodium (near-black #121113, coral accent #e75353)",
+  "version": "0.6.0",
+  "publisher": "xfcemlg",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Themes"
+  ],
+  "contributes": {
+    "themes": [
+      {
+        "label": "Darkmatter",
+        "uiTheme": "vs-dark",
+        "path": "./themes/darkmatter-color-theme.json"
+      }
+    ]
+  }
+}

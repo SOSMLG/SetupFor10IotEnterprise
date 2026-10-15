@@ -1,0 +1,12 @@
+Theme = dark
+DefaultDisplayMode = continuous
+DefaultZoom = fit width
+ShowToolbar = false
+EnableTeXEnhancements = true
+InverseSearchCmdLine = codium -g "%f":%l
+Annotations [
+    HighlightColor = #ffd966
+    UnderlineColor = #93c47d
+    SquigglyColor = #e06666
+    StrikeOutColor = #e69138
+]

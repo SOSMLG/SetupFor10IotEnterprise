@@ -12,6 +12,8 @@
   powershell -ExecutionPolicy Bypass -File install-Win-Iot.ps1 -Unattended -OfflineDir D:\Offline
   powershell -ExecutionPolicy Bypass -File install-Win-Iot.ps1 -Unattended -DriverDir D:\Drivers -Reboot
   powershell -ExecutionPolicy Bypass -File install-Win-Iot.ps1 -IncludeOptional -Unattended
+  powershell -ExecutionPolicy Bypass -File install-Win-Iot.ps1 -IncludeStudy -Unattended
+  (study pack: zotero, sumatra, miktex, typst, windows terminal + their configs.)
   powershell -ExecutionPolicy Bypass -File install-Win-Iot.ps1 -TweaksOnly
   (tweaks-only: just the tweaks on any live machine. no apps, no configs, no debloat.)
   powershell -ExecutionPolicy Bypass -File install-Win-Iot.ps1 -ConfigsOnly
@@ -31,6 +33,7 @@ param(
   [string]$Arch = '',
   [switch]$DetectHardware,
   [switch]$IncludeOptional,
+  [switch]$IncludeStudy,
   [switch]$Unattended,
   [switch]$NoWingetBootstrap,
   [switch]$NoChocoBootstrap,
@@ -45,11 +48,16 @@ param(
   [switch]$Reboot,
   [switch]$Fixes,
   [switch]$GamingTweaks,
+  [switch]$SkipBatteryCap,
   [switch]$ExtraPrivacy,
   [switch]$KeepFastStartup,
   [switch]$DnsOffByDefault,
   [switch]$NoBackup,
-  [switch]$SkipOOSU
+  [switch]$SkipOOSU,
+  [switch]$DryRun,
+  [switch]$Verify,
+  [string[]]$Only = @(),
+  [string[]]$SkipApps = @()
 )
 $ErrorActionPreference = 'Continue'
 Set-StrictMode -Version 2
@@ -63,10 +71,29 @@ $Stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 # C:\Windows\Logs needs admin. non-admin runs fall back to TEMP instead of dying.
 try { New-Item -ItemType Directory -Force -Path $LogDir -EA Stop | Out-Null }
 catch { $LogDir = Join-Path $env:TEMP 'Win-Iot-Setup'; New-Item -ItemType Directory -Force -Path $LogDir -EA SilentlyContinue | Out-Null }
+# non-admin runs land in TEMP, so the state dir follows the log dir there.
+if ($StateDir -eq 'C:\Windows\Logs\Win-Iot-Setup\state' -and $LogDir -ne 'C:\Windows\Logs\Win-Iot-Setup') { $StateDir = Join-Path $LogDir 'state' }
 $LogFile = Join-Path $LogDir "install-$Stamp.log"
 $transcriptOn = $false
 try { Start-Transcript -Path $LogFile -Force -EA Stop | Out-Null; $transcriptOn = $true } catch {}
-function Log($m) { Write-Host ("[{0:HH:mm:ss}] {1}" -f (Get-Date), $m) }
+# warn count lands in the run report. it is the number a tired human reads first.
+$script:warnCount = 0
+function Log($m) {
+  if ("$m" -like '*WARN*') { $script:warnCount++ }
+  Write-Host ("[{0:HH:mm:ss}] {1}" -f (Get-Date), $m)
+}
+# phase timers: seconds per phase, straight into the report. cheap and honest.
+$script:phaseTimes = [ordered]@{}
+$script:phaseName = $null
+$script:phaseStart = $null
+function Start-Phase($name) { $script:phaseName = $name; $script:phaseStart = Get-Date }
+function Stop-Phase {
+  if ($script:phaseName) {
+    $elapsed = (Get-Date) - $script:phaseStart
+    $script:phaseTimes[$script:phaseName] = [int][math]::Round($elapsed.TotalSeconds, 0)
+    $script:phaseName = $null
+  }
+}
 function Refresh-Path {
   # fresh installs don't land on PATH in this session. re-read it or python/codium are "missing".
   try { $env:Path = [System.Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [System.Environment]::GetEnvironmentVariable('Path','User') } catch {}
@@ -121,7 +148,8 @@ function Should-Run($phase) {
   return $true
 }
 function Complete-Phase($phase) {
-  if ($Idempotent) { Set-PhaseDone $phase }
+  # dry-run changed nothing, so nothing is done.
+  if ($Idempotent -and -not $DryRun) { Set-PhaseDone $phase }
 }
 
 # optional sha256 check for downloaded installers. config/hashes.json maps an
@@ -157,32 +185,181 @@ function Test-DownloadHash($file) {
 function Invoke-Native {
   param(
     [scriptblock]$cmd,
-    [object[]]$Args
+    [object[]]$ArgList
   )
   $LASTEXITCODE = 0
   $oldEA = $ErrorActionPreference; $ErrorActionPreference = 'Stop'
   try {
-    if ($PSBoundParameters.ContainsKey('Args') -and $null -ne $Args) { & $cmd @Args 2>&1 | Out-Null }
+    if ($PSBoundParameters.ContainsKey('ArgList') -and $null -ne $ArgList) { & $cmd @ArgList 2>&1 | Out-Null }
     else { & $cmd 2>&1 | Out-Null }
     return $LASTEXITCODE
   }
   catch { return -1 }
   finally { $ErrorActionPreference = $oldEA }
 }
-# one-shot task from FirstBoot already fired. remove it so it never refires.
-try { Unregister-ScheduledTask -TaskName 'Win-Iot-Setup' -Confirm:$false -EA Stop } catch {}
-
+# one download helper for every call site. three tries, a pause between them,
+# and BITS takes over for big files when the service is alive (it retries on
+# its own and survives rough links). $MinBytes guards the "0 byte success".
+function Test-DownloadComplete($file, $minBytes, $expectedBytes) {
+  if (-not (Test-Path $file)) { return $false }
+  try {
+    $len = (Get-Item $file).Length
+    if ($minBytes -gt 0 -and $len -lt $minBytes) { return $false }
+    if ($expectedBytes -gt 0 -and $len -ne $expectedBytes) { return $false }
+    return $true
+  } catch { return $false }
+}
+function Invoke-Download {
+  param(
+    [string]$Url,
+    [string]$OutFile,
+    [int]$TimeoutSec = 600,
+    [long]$MinBytes = 1MB,
+    [long]$ExpectedBytes = 0,
+    [switch]$Force
+  )
+  if (-not $Url -or -not $OutFile) { return $false }
+  if (-not $Force -and (Test-DownloadComplete $OutFile $MinBytes $ExpectedBytes)) { return $true }
+  $oldProg = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
+  try {
+    for ($i = 1; $i -le 3; $i++) {
+      Write-Progress -Activity 'downloading' -Status "$(Split-Path $OutFile -Leaf) (attempt $i/3)" -PercentComplete -1 -EA SilentlyContinue
+      # a partial from a killed run confuses everything, toss it first
+      try { if (Test-Path $OutFile) { Remove-Item $OutFile -Force -EA SilentlyContinue } } catch {}
+      try {
+        $bitsSvc = Get-Service BITS -EA SilentlyContinue
+        if (($MinBytes -ge 20MB -or $ExpectedBytes -ge 20MB) -and $bitsSvc -and $bitsSvc.StartType -ne 'Disabled') {
+          try { Start-BitsTransfer -Source $Url -Destination $OutFile -TransferType Download -EA Stop }
+          catch {
+            # bits breaks on some boxes (policies, dead queues). plain http does not care.
+            Log "  BITS failed ($($_.Exception.Message)), plain download instead."
+            Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing -TimeoutSec $TimeoutSec -EA Stop
+          }
+        } else {
+          Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing -TimeoutSec $TimeoutSec -EA Stop
+        }
+      } catch {
+        Log "  WARN download attempt $i failed: $($_.Exception.Message)"
+        if ($i -lt 3) { Start-Sleep -Seconds (2 * $i) }
+        continue
+      }
+      if (Test-DownloadComplete $OutFile $MinBytes $ExpectedBytes) { return $true }
+      Log "  WARN download attempt $i left a bad file, retrying."
+      if ($i -lt 3) { Start-Sleep -Seconds (2 * $i) }
+    }
+    return $false
+  } finally {
+    Write-Progress -Activity 'downloading' -Completed -EA SilentlyContinue
+    $ProgressPreference = $oldProg
+  }
+}
 function Test-Admin {
   ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
+# charge cap decision, pure so the smoke test can poke it. skip / keep / set.
+# only a positive ON counts as already-limited; anything unparsed gets the cap set.
+function Resolve-ChargeCapAction($Manufacturer, $DriverFound, $StatusText, $ExistingStart) {
+  if ("$Manufacturer" -notmatch '(?i)LENOVO') { return @{ action='skip'; why='not a lenovo machine' } }
+  if (-not $DriverFound) { return @{ action='skip'; why='lenovo PM driver missing (windows update usually brings it)' } }
+  if ("$StatusText" -match '(?i)\bON\b') { return @{ action='keep' } }
+  $start = 75
+  if ($ExistingStart -and [int]$ExistingStart -gt 0 -and [int]$ExistingStart -lt $start) { $start = [int]$ExistingStart }
+  return @{ action='set'; start=$start }
+}
+# the quickcss the first installs shipped. untouched (or empty) upgrades to the
+# real theme; anything else counts as someone's edits and is kept.
+function Test-QuickcssStale($Text) {
+  $bare = (("$Text" -replace '\uFEFF', '') -replace '\s', '')
+  if (-not $bare) { return $true }
+  return ($bare -eq '/*QuickCSSplaceholder.StockVesktoplook.Addyourownrulesbelowifyouwantthem.*/')
+}
 $isAdmin = Test-Admin
+
+# -Verify: read back the key tweaks and stop. no writes, safe any time,
+# including after a reboot, to see what actually stuck.
+if ($Verify) {
+  Log 'Verify: reading back key tweaks (no changes)...'
+  $checks = @(
+    @{ n='telemetry policy';           p='HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection';                    k='AllowTelemetry';           w=0 }
+    @{ n='long paths';                 p='HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem';                            k='LongPathsEnabled';         w=1 }
+    @{ n='rtc in utc';                 p='HKLM:\SYSTEM\CurrentControlSet\Control\TimeZoneInformation';                   k='RealTimeIsUniversal';      w=1 }
+    @{ n='lsass protected';            p='HKLM:\SYSTEM\CurrentControlSet\Control\Lsa';                                   k='RunAsPPL';                 w=1 }
+    @{ n='wdigest off';                p='HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest';            k='UseLogonCredential';       w=0 }
+    @{ n='wpbt off';                   p='HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager';                       k='DisableWpbtExecution';     w=1 }
+    @{ n='bitlocker auto-encrypt off'; p='HKLM:\SYSTEM\CurrentControlSet\Control\BitLocker';                           k='PreventDeviceEncryption';  w=1 }
+    @{ n='updates: notify first';      p='HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU';                 k='AUOptions';                w=2 }
+    @{ n='delivery optimization off';  p='HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization';             k='DODownloadMode';           w=0 }
+    @{ n='llmnr off';                  p='HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient';                      k='EnableMulticast';          w=0 }
+    @{ n='anonymous sam enum off';     p='HKLM:\SYSTEM\CurrentControlSet\Control\Lsa';                                   k='RestrictAnonymous';        w=1 }
+    @{ n='ipv4 preferred';             p='HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters';                    k='DisabledComponents';       w=32 }
+    @{ n='autorun off';                p='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer';           k='NoDriveTypeAutoRun';       w=255 }
+    @{ n='taskbar small icons';        p='HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced';           k='TaskbarSmallIcons';        w=1 }
+    @{ n='clock seconds';              p='HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced';           k='ShowSecondsInSystemClock'; w=1 }
+    @{ n='dark mode (apps)';           p='HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize';          k='AppsUseLightTheme';        w=0 }
+    @{ n='toasts off';                 p='HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\PushNotifications';           k='ToastEnabled';             w=0 }
+    @{ n='background apps off';        p='HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications'; k='GlobalUserDisabled';       w=1 }
+    @{ n='startup delay off';          p='HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Serialize';            k='StartupDelayInMSec';      w=0 }
+    @{ n='idle wait off';              p='HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Serialize';            k='WaitForIdleState';        w=0 }
+  )
+  $miss = 0
+  foreach ($c in $checks) {
+    $got = $null
+    try {
+      $item = Get-ItemProperty -Path $c.p -Name $c.k -EA Stop
+      if ($item -and ($item.PSObject.Properties.Name -contains $c.k)) { $got = $item.$($c.k) }
+    } catch {}
+    if ("$got" -eq "$($c.w)") { Log "  ok: $($c.n)" }
+    else { Log "  MISS: $($c.n) (have $(if ($null -eq $got) { 'unset' } else { $got }) want $($c.w))"; $miss++ }
+  }
+  # ported taste bit: the vscodium theme only exists after a configs run.
+  try {
+    $vsSet = Join-Path $env:APPDATA 'VSCodium\User\settings.json'
+    if (Test-Path $vsSet) {
+      $vsJson = Get-Content $vsSet -Raw | ConvertFrom-Json -EA Stop
+      $ctProp = $vsJson.PSObject.Properties['workbench.colorTheme']
+      if ($ctProp -and $ctProp.Value -eq 'Darkmatter') { Log '  ok: vscodium darkmatter theme' }
+      else { Log '  MISS: vscodium darkmatter theme (re-run with -ConfigsOnly)'; $miss++ }
+    } else { Log '  skip: vscodium theme (no settings.json yet, run -ConfigsOnly after vscodium first run)' }
+  } catch { Log "  skip: vscodium theme check ($_)" }
+  # win11 extras only land there, so only read them there. empty string is the
+  # whole point for the context menu mask, so the plain compare above cannot do it.
+  $vb = 0
+  try { $vb = [int](Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -Name CurrentBuildNumber -EA Stop).CurrentBuildNumber } catch {}
+  if ($vb -ge 22000) {
+    $cmOk = $false
+    try {
+      $cm = Get-ItemProperty 'HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32' -Name '(Default)' -EA Stop
+      $cmOk = ($cm.PSObject.Properties.Name -contains '(Default)') -and ("$($cm.'(Default)')" -eq '')
+    } catch {}
+    if ($cmOk) { Log '  ok: classic context menu' } else { Log '  MISS: classic context menu (needs empty InprocServer32 default)'; $miss++ }
+  }
+  foreach ($svc in @('DiagTrack','dmwappushservice')) {
+    $s = Get-Service $svc -EA SilentlyContinue
+    if (-not $s) { Log "  ok: $svc absent" }
+    elseif ($s.Status -eq 'Stopped' -and $s.StartType -eq 'Disabled') { Log "  ok: $svc disabled" }
+    else { Log "  MISS: $svc still $($s.StartType)/$($s.Status)"; $miss++ }
+  }
+  try {
+    $fwOff = @(Get-NetFirewallProfile -EA Stop | Where-Object { "$($_.Enabled)" -ne 'True' })
+    if ($fwOff.Count -eq 0) { Log '  ok: firewall on (all profiles)' }
+    else { Log ('  MISS: firewall off on ' + (($fwOff | ForEach-Object { $_.Name }) -join ', ')); $miss++ }
+  } catch { Log "  skip: firewall check ($_)" }
+  if ($miss) { Log "Verify: $miss thing(s) missing. re-run the installer to reapply." } else { Log 'Verify: all good.' }
+  if ($transcriptOn) { try { Stop-Transcript | Out-Null } catch {} }
+  exit $(if ($miss) { 1 } else { 0 })
+}
+
+# one-shot task from FirstBoot already fired. remove it so it never refires.
+if ($DryRun) { Log '  [dry-run] would remove the one-shot Win-Iot-Setup scheduled task.' }
+else { try { Unregister-ScheduledTask -TaskName 'Win-Iot-Setup' -Confirm:$false -EA Stop } catch {} }
 if (-not $isAdmin) { Log 'WARN: not admin. fonts and autostart will probably fail.' }
 
 # os + hardware. keeps edition/ltsc/arch detect + optional hw gate.
+# declared out here so the run report can read it even if the probe throws.
+$osInfo = $null
 try {
   $b = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion').CurrentBuild
   Log "OS build: $b"
-  $osInfo = $null
   if (Get-Command Get-OSInfo -EA SilentlyContinue) { $osInfo = Get-OSInfo }
   if ($osInfo) {
     Log ("OS: {0} {1} ({2}) arch={3}" -f $osInfo.ProductName, $osInfo.Version, $osInfo.Build, $osInfo.Architecture)
@@ -191,14 +368,22 @@ try {
     if ($osInfo.IsWin10LTSC -or $osInfo.IsWin11LTSC) { Log "  $family LTSC/IoT detected ($($osInfo.Build))." }
     elseif ($osInfo.IsLTSC -or $osInfo.IsIoT) { Log "  LTSC/IoT edition detected ($family $($osInfo.Build))." }
     else { Log "  WARN: not an LTSC/IoT edition ($family $($osInfo.Build)). going ahead anyway." }
-    # tweaks are one set for both 10 and 11 ltsc. win11-only extras are not applied.
-    if ($osInfo.IsWin11) { Log '  note: same tweak set as win10; win11-only extras are not applied.' }
+    # tweaks are one set for both 10 and 11 ltsc. a few win11 extras (classic
+    # context menu, widgets/chat buttons, copilot/recall off) ride the tweaks
+    # phase on 11 only, and the log says which way it went.
   }
   # known ltsc builds: 17763 = win10 iot ltsc 2019, 19044 = win10 iot ltsc 2021,
   # 26100 = win11 (iot) enterprise ltsc 2024. anything else, warn + keep going.
   $knownLtsc = @('17763', '19044', '26100')
   if ($osInfo -and ($osInfo.IsLTSC -or $osInfo.IsIoT) -and ($knownLtsc -notcontains [string]$b)) { Log "WARN: LTSC build $b not in known list. going ahead anyway, watch the log." }
 } catch { Log "WARN: OS check failed: $_" }
+# gate for the win11-only tweaks. osInfo can be absent (lib/ missing), in which
+# case read the raw build number so the gate still makes the right call.
+$isWin11 = $false
+if ($osInfo) { $isWin11 = [bool]$osInfo.IsWin11 }
+else {
+  try { $isWin11 = [int](Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion').CurrentBuild -ge 22000 } catch {}
+}
 
 # arch gate: this repo assumes x64. warn loudly if someone runs it on arm32.
 if ($env:PROCESSOR_ARCHITECTURE -and $env:PROCESSOR_ARCHITECTURE -ne 'AMD64') {
@@ -217,7 +402,7 @@ if ($DetectHardware -and (Get-Command Test-HardwareMin -EA SilentlyContinue)) {
 # templates/autounattend.xml.tpl is the source of truth now. if it exists and
 # -SkipTemplateGen was not passed, render ISO/autounattend.xml from it so the
 # repo copy can never drift from the template. ventoy copy stays a manual mirror.
-if ((-not $SkipTemplateGen) -and (-not $TweaksOnly) -and (-not $ConfigsOnly) -and (-not $Unattended)) {
+if ((-not $SkipTemplateGen) -and (-not $TweaksOnly) -and (-not $ConfigsOnly) -and (-not $Unattended) -and (-not $DryRun)) {
   $tpl = Join-Path $Repo 'templates\autounattend.xml.tpl'
   if (Test-Path $tpl) {
     try {
@@ -230,24 +415,29 @@ if ((-not $SkipTemplateGen) -and (-not $TweaksOnly) -and (-not $ConfigsOnly) -an
       $sysLoc = if ($cfg -and $cfg.locales.system) { $cfg.locales.system } else { 'en-US' }
       $uiLoc = if ($cfg -and $cfg.locales.ui) { $cfg.locales.ui } else { 'en-US' }
       $userLoc = if ($cfg -and $cfg.locales.user) { $cfg.locales.user } else { 'en-001' }
-      $body = Get-Content $tpl -Raw
+      $body = [string](Get-Content $tpl -Raw)
       $body = $body.Replace('{{ARCH}}', $arch).Replace('{{USERNAME}}', $userName).Replace('{{INPUT_LOCALE}}', $inLoc).Replace('{{SYSTEM_LOCALE}}', $sysLoc).Replace('{{UILANGUAGE}}', $uiLoc).Replace('{{USERLOCALE}}', $userLoc)
       $outXml = Join-Path $Repo 'ISO\autounattend.xml'
-      $existing = if (Test-Path $outXml) { Get-Content $outXml -Raw } else { '' }
-      if ($body -ne $existing) {
-        if (Test-Path (Split-Path $outXml)) { Set-Content -Path $outXml -Value $body -Encoding UTF8 -EA Stop; Log '  autounattend.xml regenerated from template.' }
+      # [string] cast: Get-Content -Raw gives $null on an empty file, and $null.TrimEnd() throws.
+      $existing = if (Test-Path $outXml) { [string](Get-Content $outXml -Raw) } else { '' }
+      # compare trimmed: a trailing newline is no reason to rewrite every run.
+      if ($body.TrimEnd() -ne $existing.TrimEnd()) {
+        # writealltext: no bom, no added newline, so the next run compares equal.
+        if (Test-Path (Split-Path $outXml)) { [System.IO.File]::WriteAllText($outXml, $body); Log '  autounattend.xml regenerated from template.' }
       } else { Log '  autounattend.xml already matches template.' }
     } catch { Log "  WARN template gen: $_" }
   }
 }
 
-if (-not $Unattended) {
+if ((-not $Unattended) -and (-not $DryRun)) {
   try { Set-ExecutionPolicy RemoteSigned -Scope CurrentUser -Force -EA SilentlyContinue } catch {}
 }
 
 # no net + no OfflineDir means nothing to install. say so now, not 20 min in.
+# probe ip is just a beacon, works even when dns is broken.
+$netProbe = '1.1.1.1'
 $online = $false
-try { $online = Test-Connection -ComputerName 8.8.8.8 -Count 1 -Quiet -EA Stop } catch {}
+try { $online = Test-Connection -ComputerName $netProbe -Count 1 -Quiet -EA Stop } catch {}
 if (-not $online -and -not $OfflineDir) {
   Log 'WARN: no network detected and no -OfflineDir given.'
   Log '  plug phone in for usb tethering, or seed ISO/Offline via Get-Offline.ps1 on an online PC'
@@ -258,39 +448,63 @@ if (-not $online) { Log 'OFFLINE mode: online engines skipped; pre-seeded files 
 # fresh boot almost never has DHCP yet. usb tethering takes a few min to enable,
 # so wait up to 10 min or winget dies for no reason.
 # tweaks need no net, so tweaks-only skips the wait entirely.
-if ((-not $online) -and (-not $TweaksOnly) -and (-not $ConfigsOnly)) {
+# dry-run installs nothing, so it skips the wait too.
+if ((-not $online) -and (-not $TweaksOnly) -and (-not $ConfigsOnly) -and (-not $DryRun)) {
   $waited = 0
   while (-not $online -and $waited -lt 600) {
     Start-Sleep -Seconds 15; $waited += 15
-    try { $online = Test-Connection -ComputerName 8.8.8.8 -Count 1 -Quiet -EA Stop } catch {}
+    try { $online = Test-Connection -ComputerName $netProbe -Count 1 -Quiet -EA Stop } catch {}
   }
   if ($online) { Log "network up after ${waited}s." }
   else { Log 'WARN: still offline after 10 min - continuing with pre-seeded files only.' }
 }
 
+# preflight: cheap checks now beat a 20 min run dying at download #7.
+try {
+  $sysDrive = Get-PSDrive ($env:SystemDrive -replace ':','') -EA Stop
+  $freeGB = [math]::Round($sysDrive.Free / 1GB, 1)
+  if ($freeGB -lt 1.5) { Log "WARN: only $freeGB GB free on $env:SystemDrive. installs will likely fail." }
+  elseif ($freeGB -lt 4) { Log "WARN: $freeGB GB free on $env:SystemDrive. tight for downloads + installs." }
+  else { Log "disk: $freeGB GB free on $env:SystemDrive." }
+} catch { Log "WARN: disk check: $_" }
+if ($OfflineDir) {
+  if (-not (Test-Path $OfflineDir)) { Log "WARN: -OfflineDir not found: $OfflineDir" }
+  else {
+    $staged = @(Get-ChildItem $OfflineDir -Recurse -File -EA SilentlyContinue)
+    if ($staged.Count -eq 0) { Log "WARN: -OfflineDir is empty: $OfflineDir" }
+    else { Log "offline: $($staged.Count) staged files in $OfflineDir." }
+  }
+}
+
 # ---------- 0. repairs. opt-in only (-Fixes), runs before everything. ----------
 if ($Fixes) {
   Log 'Repairs...'
-  $exit = Invoke-Native { ipconfig /flushdns }
-  if ($exit -eq 0) { Log '  dns cache flushed.' } else { Log "  WARN flushdns exit=$exit" }
-  try {
-    foreach ($svc in @('Dnscache','NlaSvc')) {
-      if (Get-Service $svc -EA SilentlyContinue) { Restart-Service $svc -Force -EA Stop; Log "  svc restarted: $svc" }
-    }
-  } catch { Log "  WARN net services: $_" }
-  $exit = Invoke-Native { netsh winsock reset }
-  if ($exit -eq 0) { Log '  winsock reset (needs the reboot at the end).' } else { Log "  WARN winsock exit=$exit" }
-  if ($isAdmin) {
-    # update stack reset. stops services, parks the caches aside, starts over.
+  Start-Phase 'repairs'
+  if ($DryRun) {
+    Log '  [dry-run] would flush dns, restart Dnscache/NlaSvc, reset winsock, park the update caches.'
+  } else {
+    $exit = Invoke-Native { ipconfig /flushdns }
+    if ($exit -eq 0) { Log '  dns cache flushed.' } else { Log "  WARN flushdns exit=$exit" }
     try {
-      foreach ($svc in @('wuauserv','bits','cryptsvc')) { Stop-Service $svc -Force -EA SilentlyContinue }
-      foreach ($d in @('C:\Windows\SoftwareDistribution','C:\Windows\System32\catroot2')) {
-        if ((Test-Path $d) -and -not (Test-Path "$d.bak")) { Rename-Item $d "$d.bak" -Force -EA Stop; Log "  parked: $d" }
+      foreach ($svc in @('Dnscache','NlaSvc')) {
+        if (Get-Service $svc -EA SilentlyContinue) { Restart-Service $svc -Force -EA Stop; Log "  svc restarted: $svc" }
       }
-      foreach ($svc in @('cryptsvc','bits','wuauserv')) { Start-Service $svc -EA SilentlyContinue }
-      Log '  update stack reset.'
-    } catch { Log "  WARN update reset: $_" }
-  } else { Log '  update reset needs admin. skipped.' }
+    } catch { Log "  WARN net services: $_" }
+    $exit = Invoke-Native { netsh winsock reset }
+    if ($exit -eq 0) { Log '  winsock reset (needs the reboot at the end).' } else { Log "  WARN winsock exit=$exit" }
+    if ($isAdmin) {
+      # update stack reset. stops services, parks the caches aside, starts over.
+      try {
+        foreach ($svc in @('wuauserv','bits','cryptsvc')) { Stop-Service $svc -Force -EA SilentlyContinue }
+        foreach ($d in @('C:\Windows\SoftwareDistribution','C:\Windows\System32\catroot2')) {
+          if ((Test-Path $d) -and -not (Test-Path "$d.bak")) { Rename-Item $d "$d.bak" -Force -EA Stop; Log "  parked: $d" }
+        }
+        foreach ($svc in @('cryptsvc','bits','wuauserv')) { Start-Service $svc -EA SilentlyContinue }
+        Log '  update stack reset.'
+      } catch { Log "  WARN update reset: $_" }
+    } else { Log '  update reset needs admin. skipped.' }
+  }
+  Stop-Phase
   Complete-Phase 'repairs'
 }
 
@@ -298,6 +512,7 @@ if ($Fixes) {
 # win10 updates come as one blob, no security-only split exists.
 # LTSC + "tell me first" + no surprise reboots + no driver pushes. good enough.
 function Set-Reg($path, $name, $value, $type = 'DWord') {
+  if ($DryRun) { Log "  [dry-run] would set ${path}\${name} = $value"; return }
   try {
     # HKU: drive never exists by default. mount it once or the .DEFAULT key dies.
     if ($path -like 'HKU:*' -and -not (Get-PSDrive HKU -EA SilentlyContinue)) {
@@ -325,25 +540,30 @@ if ($NextDNS) { $Dns = 'NextDNS' }
 if ($DNSAuto -and -not $AdGuard -and -not $NextDNS -and -not $PSBoundParameters.ContainsKey('Dns')) { $Dns = 'Auto' }
 if ((-not $NoTweaks) -and (Should-Run 'tweaks')) {
   Log 'Sane defaults...'
+  Start-Phase 'tweaks'
   if ($isAdmin -and -not $NoBackup) {
-    $stamp = (Get-Date).ToString('yyyyMMdd-HHmmss')
-    $regbak = Join-Path $LogDir "RegBackups-$stamp"
-    try {
-      New-Item -ItemType Directory -Force -Path $regbak -EA Stop | Out-Null
-      $exports = @(
-        'HKLM\SOFTWARE\Policies',
-        'HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies',
-        'HKLM\SYSTEM\CurrentControlSet\Control\Lsa'
-      )
-      foreach ($r in $exports) {
-        $out = Join-Path $regbak ($r -replace '\\','_').Replace(':','').ToLower() + '.reg'
-        $null = Invoke-Native { param($root,$f); reg export $root $f /y } -Args $r,$out
+    if ($DryRun) {
+      Log '  [dry-run] would export policy + lsa keys to a reg-backup folder.'
+    } else {
+      $stamp = (Get-Date).ToString('yyyyMMdd-HHmmss')
+      $regbak = Join-Path $LogDir "RegBackups-$stamp"
+      try {
+        New-Item -ItemType Directory -Force -Path $regbak -EA Stop | Out-Null
+        $exports = @(
+          'HKLM\SOFTWARE\Policies',
+          'HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies',
+          'HKLM\SYSTEM\CurrentControlSet\Control\Lsa'
+        )
+        foreach ($r in $exports) {
+          $out = Join-Path $regbak ($r -replace '\\','_').Replace(':','').ToLower() + '.reg'
+          $null = Invoke-Native { param($root,$f); reg export $root $f /y } -ArgList $r,$out
+        }
+        $hkcuOut = Join-Path $regbak 'hkcu_software_policies.reg'
+        $null = Invoke-Native { param($f); reg export 'HKCU\SOFTWARE\Policies' $f /y } -ArgList $hkcuOut
+        Log "Reg-backup: $regbak"
+      } catch {
+        Log "WARN reg-backup failed: $_"
       }
-      $hkcuOut = Join-Path $regbak 'hkcu_software_policies.reg'
-      $null = Invoke-Native { param($f); reg export 'HKCU\SOFTWARE\Policies' $f /y } -Args $hkcuOut
-      Log "Reg-backup: $regbak"
-    } catch {
-      Log "WARN reg-backup failed: $_"
     }
   } elseif ($isAdmin -and $NoBackup) {
     Log 'Reg-backup skipped (-NoBackup).'
@@ -351,22 +571,28 @@ if ((-not $NoTweaks) -and (Should-Run 'tweaks')) {
   if ($isAdmin) {
     # restore point first. tiny10 usually ripped system restore out, so don't hold your breath.
     if (-not $NoBackup) {
-      try { Checkpoint-Computer -Description 'Win-Iot-Setup pre-tweaks' -RestorePointType MODIFY_SETTINGS -EA Stop; Log '  restore point created.' }
-      catch { Log '  WARN restore point: unavailable (common on tiny10) - continuing.' }
+      if ($DryRun) { Log '  [dry-run] would create a restore point.' }
+      else {
+        try { Checkpoint-Computer -Description 'Win-Iot-Setup pre-tweaks' -RestorePointType MODIFY_SETTINGS -EA Stop; Log '  restore point created.' }
+        catch { Log '  WARN restore point: unavailable (common on tiny10) - continuing.' }
+      }
     } else {
       Log '  restore point skipped (-NoBackup).'
     }
     # O&O ShutUp10++ next, our reg values after, so ours win any overlap.
     if (-not $SkipOOSU) {
-      try {
-        $oosu = Join-Path $Repo 'OOSU\OOSHUTUP10.exe'
-        $oocfg = Join-Path $Repo 'OOSU\ooshutup10.cfg'
-        if ((Test-Path $oosu) -and (Test-Path $oocfg)) {
-          Log '  O&O ShutUp10++ applying cfg...'
-          $proc = Start-Process -FilePath $oosu -ArgumentList '/quiet','/cfg',$oocfg -Wait -PassThru
-          if ($proc.ExitCode -eq 0) { Log '  O&O applied.' } else { Log "  WARN O&O exit=$($proc.ExitCode)" }
-        } else { Log '  O&O skipped (exe/cfg missing from OOSU/).' }
-      } catch { Log "  WARN O&O: $_" }
+      if ($DryRun) { Log '  [dry-run] would run O&O ShutUp10++ with the titus cfg.' }
+      else {
+        try {
+          $oosu = Join-Path $Repo 'OOSU\OOSHUTUP10.exe'
+          $oocfg = Join-Path $Repo 'OOSU\ooshutup10.cfg'
+          if ((Test-Path $oosu) -and (Test-Path $oocfg)) {
+            Log '  O&O ShutUp10++ applying cfg...'
+            $proc = Start-Process -FilePath $oosu -ArgumentList '/quiet','/cfg',$oocfg -Wait -PassThru
+            if ($proc.ExitCode -eq 0) { Log '  O&O applied.' } else { Log "  WARN O&O exit=$($proc.ExitCode)" }
+          } else { Log '  O&O skipped (exe/cfg missing from OOSU/).' }
+        } catch { Log "  WARN O&O: $_" }
+      }
     } else {
       Log '  O&O ShutUp10++ skipped (-SkipOOSU).'
     }
@@ -374,11 +600,13 @@ if ((-not $NoTweaks) -and (Should-Run 'tweaks')) {
     Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection' 'AllowTelemetry' 0
     Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection' 'AllowTelemetry' 0
     foreach ($svc in @('DiagTrack','dmwappushservice')) {
+      if ($DryRun) { Log "  [dry-run] would disable: $svc"; continue }
       try { Stop-Service $svc -Force -EA SilentlyContinue; Set-Service $svc -StartupType Disabled -EA Stop; Log "  svc disabled: $svc" }
       catch { Log "  WARN svc ${svc}: $_" }
     }
     # titus sets these to manual. only touching ones that exist and don't matter.
     foreach ($svc in @('MapsBroker','lfsvc','XblAuthManager','XblGameSave','XboxGipSvc','XboxNetApiSvc','RetailDemo','WalletService','wisvc','CDPSvc')) {
+      if ($DryRun) { Log "  [dry-run] would set to manual if present: $svc"; continue }
       try {
         if (Get-Service $svc -EA SilentlyContinue) { Set-Service $svc -StartupType Manual -EA Stop; Log "  svc manual: $svc" }
       } catch { Log "  WARN svc ${svc}: $_" }
@@ -387,11 +615,14 @@ if ((-not $NoTweaks) -and (Should-Run 'tweaks')) {
     Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl' 'DisplayParameters' 1
     Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl' 'DisableEmoticon' 1
     # svchost split matched to ram. fewer idle processes hanging around.
-    try {
-      $memKB = (Get-CimInstance Win32_PhysicalMemory -EA Stop | Measure-Object Capacity -Sum).Sum / 1KB
-      Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control' -Name 'SvcHostSplitThresholdInKB' -Value ([uint32]$memKB) -EA Stop
-      Log '  svchost split matched to ram.'
-    } catch { Log "  WARN svchost split: $_" }
+    if ($DryRun) { Log '  [dry-run] would match the svchost split threshold to ram.' }
+    else {
+      try {
+        $memKB = (Get-CimInstance Win32_PhysicalMemory -EA Stop | Measure-Object Capacity -Sum).Sum / 1KB
+        Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control' -Name 'SvcHostSplitThresholdInKB' -Value ([uint32]$memKB) -EA Stop
+        Log '  svchost split matched to ram.'
+      } catch { Log "  WARN svchost split: $_" }
+    }
     # tell-me-first updates, no reboot while logged in, and windows keeps its hands off my drivers.
     Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' 'AUOptions' 2
     Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' 'NoAutoRebootWithLoggedOnUsers' 1
@@ -425,31 +656,167 @@ if ((-not $NoTweaks) -and (Should-Run 'tweaks')) {
     # WPBT lets vendor blobs run at boot. off.
     Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' 'DisableWpbtExecution' 1
     # teredo off. xbox tunneling only, pure attack surface otherwise.
-    $exit = Invoke-Native { netsh interface teredo set state disabled }
-    if ($exit -eq 0) { Log '  teredo off.' } else { Log "  WARN teredo exit=$exit" }
+    if ($DryRun) { Log '  [dry-run] would turn teredo off.' }
+    else {
+      $exit = Invoke-Native { netsh interface teredo set state disabled }
+      if ($exit -eq 0) { Log '  teredo off.' } else { Log "  WARN teredo exit=$exit" }
+    }
     # clock reads RTC as UTC. dual-boot friendly, linux does the same.
     Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\TimeZoneInformation' 'RealTimeIsUniversal' 1
     # clock may be off after the rtc flip. sync once when online, warn and move on.
     if ($online) {
-      $exit = Invoke-Native { w32tm /resync }
-      if ($exit -eq 0) { Log '  clock synced.' } else { Log "  WARN clock sync exit=$exit (syncs on its own later)" }
+      if ($DryRun) { Log '  [dry-run] would resync the clock.' }
+      else {
+        $exit = Invoke-Native { w32tm /resync }
+        if ($exit -eq 0) { Log '  clock synced.' } else { Log "  WARN clock sync exit=$exit (syncs on its own later)" }
+      }
     }
-    # ultimate plan if the sku carries it, high performance otherwise. tiny10 parks on balanced.
-    $exit = Invoke-Native { powercfg /duplicatescheme e9a42b02-d5df-448d-aa00-03f14749eb61 }
-    if ($exit -eq 0) { $exit = Invoke-Native { powercfg /setactive e9a42b02-d5df-448d-aa00-03f14749eb61 } }
-    if ($exit -eq 0) { Log '  power: ultimate performance.' }
+    # plan: laptop -> balanced, desktop -> ultimate if the sku carries it, high perf
+    # otherwise. a desk with a ups also reports a battery, so trust the system type
+    # first and only fall back to the battery count.
+    $isLaptop = $false
+    try {
+      $sysType = (Get-CimInstance Win32_ComputerSystem -EA Stop).PCSystemType
+      if ($sysType) { $isLaptop = ([int]$sysType -eq 2) }
+      else { $isLaptop = @(Get-CimInstance Win32-Battery -EA Stop).Count -gt 0 }
+    } catch { try { $isLaptop = @(Get-CimInstance Win32-Battery -EA Stop).Count -gt 0 } catch {} }
+    if ($isLaptop) {
+      if ($DryRun) { Log '  [dry-run] would keep the balanced power plan (laptop here).' }
+      else {
+        $exit = Invoke-Native { powercfg /setactive 381b4222-f694-41f0-9685-ff5bb260df2e }
+        if ($exit -eq 0) { Log '  power: balanced (laptop found, that one is on purpose).' } else { Log "  WARN power plan exit=$exit" }
+      }
+    }
+    elseif ($DryRun) { Log '  [dry-run] would switch to the ultimate/high performance power plan.' }
     else {
-      $exit = Invoke-Native { powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635ec }
-      if ($exit -eq 0) { Log '  power: high performance.' } else { Log "  WARN power plan exit=$exit" }
+      $exit = Invoke-Native { powercfg /duplicatescheme e9a42b02-d5df-448d-aa00-03f14749eb61 }
+      if ($exit -eq 0) { $exit = Invoke-Native { powercfg /setactive e9a42b02-d5df-448d-aa00-03f14749eb61 } }
+      if ($exit -eq 0) { Log '  power: ultimate performance.' }
+      else {
+        $exit = Invoke-Native { powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c }
+        if ($exit -eq 0) { Log '  power: high performance.' } else { Log "  WARN power plan exit=$exit" }
+      }
     }
+    # battery manners, straight off the linux box: screen dies fast on cells,
+    # sleep after half an hour on battery, never while plugged in.
+    if ($DryRun) { Log '  [dry-run] would set screen/sleep timeouts (screen 3/10 min, sleep 30 min on battery, never on ac).' }
+    else {
+      $ok = $true
+      $exit = Invoke-Native { powercfg /change monitor-timeout-dc 3 };   if ($exit -ne 0) { $ok = $false; Log "  WARN monitor-timeout-dc exit=$exit" }
+      $exit = Invoke-Native { powercfg /change monitor-timeout-ac 10 };  if ($exit -ne 0) { $ok = $false; Log "  WARN monitor-timeout-ac exit=$exit" }
+      $exit = Invoke-Native { powercfg /change standby-timeout-dc 30 };  if ($exit -ne 0) { $ok = $false; Log "  WARN standby-timeout-dc exit=$exit" }
+      $exit = Invoke-Native { powercfg /change standby-timeout-ac 0 };   if ($exit -ne 0) { $ok = $false; Log "  WARN standby-timeout-ac exit=$exit" }
+      if ($ok) { Log '  power: screen 3/10 min, sleep 30 min on battery, never on ac.' }
+    }
+    if ($isLaptop) {
+      # lid: suspend on battery, do nothing while docked. guids are the standard button-action pair.
+      if ($DryRun) { Log '  [dry-run] would set lid action: suspend on battery, nothing on ac.' }
+      else {
+        $lidSub = '4f971e89-eebd-4455-a8de-9e59040e7347'
+        $lidVal = '5ca83367-6e45-459f-a27b-476b1d01c936'
+        $exit = Invoke-Native { powercfg /setdcvalueindex SCHEME_CURRENT $lidSub $lidVal 1 }
+        if ($exit -eq 0) { $exit = Invoke-Native { powercfg /setacvalueindex SCHEME_CURRENT $lidSub $lidVal 0 } }
+        if ($exit -eq 0) { $exit = Invoke-Native { powercfg /setactive SCHEME_CURRENT } }
+        if ($exit -eq 0) { Log '  lid: suspend on battery, stay awake on ac.' } else { Log "  WARN lid action exit=$exit" }
+      }
+    }
+    # thinkpad charge cap, 80/75 like tlp on the linux box. lenovo only, and only
+    # when the power driver shows up. lenovo's own little chargethreshold.exe does
+    # it, no vantage install. firmware-level, so it survives reboots and dual boot.
+    if (-not $SkipBatteryCap) {
+      $manufacturer = ''
+      try { $manufacturer = "$((Get-CimInstance Win32_ComputerSystem -EA Stop).Manufacturer)" } catch {}
+      $pmDriver = $false
+      try { $pmDriver = (Test-Path 'HKLM:\SOFTWARE\WOW6432Node\Lenovo\PWRMGRV') -or [bool](Get-Service IBMPMDRV -EA SilentlyContinue) } catch {}
+      $cap = Resolve-ChargeCapAction -Manufacturer $manufacturer -DriverFound $pmDriver -StatusText '' -ExistingStart $null
+      if ($cap.action -eq 'skip') { Log "  charge cap: $($cap.why), skipped." }
+      elseif ($DryRun) { Log '  [dry-run] would set the lenovo charge cap to 80/75 (already-limited state kept).' }
+      else {
+        $ctExe = Join-Path $env:TEMP 'ChargeThreshold.exe'
+        $ctUrl = 'https://download.lenovo.com/pccbbs/thinkvantage_en/metroapps/Vantage/ChargeThreshold/ChargeThreshold.exe'
+        # sha256 pinned in config/hashes.json, lenovo signature on top of that.
+        $got = Invoke-Download -Url $ctUrl -OutFile $ctExe -MinBytes 50KB -TimeoutSec 120
+        if ($got) {
+          $ctItem = Get-Item $ctExe -EA SilentlyContinue
+          if ($ctItem -and (-not (Test-DownloadHash $ctItem))) {
+            # mismatch tossed the file. one clean retry, then give up.
+            $got = Invoke-Download -Url $ctUrl -OutFile $ctExe -MinBytes 50KB -TimeoutSec 120 -Force
+            if ($got) {
+              $ctItem = Get-Item $ctExe -EA SilentlyContinue
+              $got = [bool]($ctItem -and (Test-DownloadHash $ctItem))
+            }
+          }
+        }
+        if (-not $got) {
+          Log '  WARN charge cap: download failed or hash mismatch, skipped.'
+        } else {
+          $sig = $null
+          try { $sig = Get-AuthenticodeSignature $ctExe -EA Stop } catch {}
+          if (-not $sig -or $sig.Status -ne 'Valid' -or "$($sig.SignerCertificate.Subject)" -notmatch 'Lenovo') {
+            Log '  WARN charge cap: exe failed the lenovo signature check, skipped.'
+          } else {
+            # lower start percentages were a deliberate choice on boxes that had
+            # one (60 instead of 75). keep them, same rule as the linux script.
+            $ckBase = 'HKLM:\SOFTWARE\WOW6432Node\Lenovo\PWRMGRV\ConfKeys\Data'
+            $existing = $null
+            foreach ($sub in @(Get-ChildItem $ckBase -EA SilentlyContinue)) {
+              $cur = $null
+              try { $cur = (Get-ItemProperty -Path $sub.PSPath -Name 'ChargeStartPercentage' -EA SilentlyContinue).ChargeStartPercentage } catch {}
+              if ($cur -and (-not $existing -or [int]$cur -lt [int]$existing)) { $existing = [int]$cur }
+            }
+            $statusText = (& $ctExe status 2>&1 | Out-String)
+            $cap = Resolve-ChargeCapAction -Manufacturer $manufacturer -DriverFound $true -StatusText $statusText -ExistingStart $existing
+            if ($cap.action -eq 'keep') {
+              $capLine = (($statusText -split "`r?`n" | Where-Object { $_.Trim() }) -join ' | ')
+              Log "  charge cap: already limited, left as-is ($capLine)"
+            } else {
+              & $ctExe on 80 $cap.start | Out-Null
+              $onExit = $LASTEXITCODE
+              if ($onExit -ne 0) { Log "  WARN charge cap: set exit=$onExit" }
+              $after = (& $ctExe status 2>&1 | Out-String)
+              if ($after -match '(?i)\bOFF\b') {
+                # known lenovo driver bug: the pwr mgrv reg values are missing so
+                # the write reads back off. fill them in and ask once more.
+                try {
+                  foreach ($sub in @(Get-ChildItem $ckBase -EA Stop)) {
+                    New-ItemProperty -Path $sub.PSPath -Name 'ChargeStartControl' -Value 1 -PropertyType DWord -Force -EA Stop | Out-Null
+                    New-ItemProperty -Path $sub.PSPath -Name 'ChargeStartPercentage' -Value $cap.start -PropertyType DWord -Force -EA Stop | Out-Null
+                    New-ItemProperty -Path $sub.PSPath -Name 'ChargeStopControl' -Value 1 -PropertyType DWord -Force -EA Stop | Out-Null
+                    New-ItemProperty -Path $sub.PSPath -Name 'ChargeStopPercentage' -Value 80 -PropertyType DWord -Force -EA Stop | Out-Null
+                  }
+                  & $ctExe on 80 $cap.start | Out-Null
+                  $onExit = $LASTEXITCODE
+                  $after = (& $ctExe status 2>&1 | Out-String)
+                } catch { Log "  WARN charge cap reg fill: $_" }
+              }
+              # only a positive ON counts as a win. the exe can print nothing useful
+              # and the driver loves a silent OFF.
+              if ($after -match '(?i)\bON\b') {
+                $capLine = (($after -split "`r?`n" | Where-Object { $_.Trim() }) -join ' | ')
+                Log "  charge cap: lenovo set to 80/$($cap.start) ($capLine)"
+              } elseif ($after -match '(?i)\bOFF\b') {
+                Log '  WARN charge cap: hardware still reports OFF. set it by hand: ChargeThreshold.exe on 80 75'
+              } else {
+                Log "  WARN charge cap: could not confirm (exit=$onExit). read it yourself: ChargeThreshold.exe status"
+              }
+            }
+          }
+        }
+      }
+    } else { Log '  charge cap skipped (-SkipBatteryCap).' }
     # reserved storage off. small disks need those gigs back.
-    try { Set-WindowsReservedStorageState -State Disabled -EA Stop; Log '  reserved storage off.' }
-    catch { Log "  WARN reserved storage: $_" }
+    if ($DryRun) { Log '  [dry-run] would turn reserved storage off.' }
+    else {
+      try { Set-WindowsReservedStorageState -State Disabled -EA Stop; Log '  reserved storage off.' }
+      catch { Log "  WARN reserved storage: $_" }
+    }
     # IPv4 preferred, IPv6 stays alive. full disable breaks things, this doesn't.
     Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters' 'DisabledComponents' 32
     # resolver from -Dns on every live adapter. Auto/DHCP resets to dhcp-supplied.
     try {
-      if ($DnsOffByDefault -and -not $PSBoundParameters.ContainsKey('Dns')) {
+      if ($DryRun) {
+        Log "  [dry-run] would set DNS ($Dns) on live adapters."
+      } elseif ($DnsOffByDefault -and -not $PSBoundParameters.ContainsKey('Dns')) {
         Log '  DNS not changed (-DnsOffByDefault and no -Dns specified).'
       } else {
         $servers = $null
@@ -482,18 +849,24 @@ if ((-not $NoTweaks) -and (Should-Run 'tweaks')) {
     # tcp/serial directly, none of it needs smb1, llmnr, netbios or wpad.
     # smb1 off. 90s protocol, ransomware's favorite door.
     try {
-      $smb = Get-WindowsOptionalFeature -Online -FeatureName 'SMB1Protocol' -EA Stop
-      if ($smb -and $smb.State -ne 'Disabled') { Disable-WindowsOptionalFeature -Online -FeatureName 'SMB1Protocol' -NoRestart -EA Stop | Out-Null; Log '  SMB1 removed.' }
-      else { Log '  SMB1 already gone.' }
+      if ($DryRun) { Log '  [dry-run] would remove SMB1 when present.' }
+      else {
+        $smb = Get-WindowsOptionalFeature -Online -FeatureName 'SMB1Protocol' -EA Stop
+        if ($smb -and $smb.State -ne 'Disabled') { Disable-WindowsOptionalFeature -Online -FeatureName 'SMB1Protocol' -NoRestart -EA Stop | Out-Null; Log '  SMB1 removed.' }
+        else { Log '  SMB1 already gone.' }
+      }
     } catch { Log "  WARN SMB1: $_" }
     # llmnr off. poisoned answers on lab lans start here.
     Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient' 'EnableMulticast' 0
     # netbios off per live adapter. same reason, older protocol.
     try {
-      Get-WmiObject Win32_NetworkAdapterConfiguration -Filter "IPEnabled='TRUE'" -EA Stop | ForEach-Object {
-        $r = $_.SetTcpipNetbios(2)
-        if ($r.ReturnValue -in @(0,1)) { Log "  netbios off: $($_.Description)" }
-        else { Log "  WARN netbios $($_.Description): ret=$($r.ReturnValue)" }
+      if ($DryRun) { Log '  [dry-run] would turn netbios off on live adapters.' }
+      else {
+        Get-CimInstance Win32_NetworkAdapterConfiguration -Filter "IPEnabled='TRUE'" -EA Stop | ForEach-Object {
+          $r = Invoke-CimMethod -InputObject $_ -MethodName SetTcpipNetbios -Arguments @{ TcpipNetbiosOptions = [uint32]2 } -EA Stop
+          if ($r.ReturnValue -in @(0,1)) { Log "  netbios off: $($_.Description)" }
+          else { Log "  WARN netbios $($_.Description): ret=$($r.ReturnValue)" }
+        }
       }
     } catch { Log "  WARN netbios: $_" }
     # anonymous sam enumeration off. default on win10, stated plainly.
@@ -506,23 +879,31 @@ if ((-not $NoTweaks) -and (Should-Run 'tweaks')) {
     Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest' 'UseLogonCredential' 0
     # guest account stays off.
     try {
-      $g = Get-LocalUser -Name 'Guest' -EA Stop
-      if ($g.Enabled) { Disable-LocalUser -Name 'Guest' -EA Stop; Log '  guest disabled.' }
-      else { Log '  guest already off.' }
+      if ($DryRun) { Log '  [dry-run] would disable the guest account.' }
+      else {
+        $g = Get-LocalUser -Name 'Guest' -EA Stop
+        if ($g.Enabled) { Disable-LocalUser -Name 'Guest' -EA Stop; Log '  guest disabled.' }
+        else { Log '  guest already off.' }
+      }
     } catch { Log "  WARN guest: $_" }
     # firewall on, all profiles. we never punch holes, so nothing breaks.
-    try { Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled True -EA Stop; Log '  firewall on (all profiles).' }
+    try {
+      if ($DryRun) { Log '  [dry-run] would turn the firewall on (all profiles).' }
+      else { Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled True -EA Stop; Log '  firewall on (all profiles).' }
+    }
     catch { Log "  WARN firewall: $_" }
     # defender realtime on if the trim kept it. enabling only, never disabling.
     try {
-      if (Get-Command Get-MpComputerStatus -EA SilentlyContinue) {
+      if ($DryRun) { Log '  [dry-run] would make sure defender realtime is on.' }
+      elseif (Get-Command Get-MpComputerStatus -EA SilentlyContinue) {
         Set-MpPreference -DisableRealtimeMonitoring $false -EA Stop; Log '  defender realtime on.'
       } else { Log '  defender absent on this trim. skipped.' }
     } catch { Log "  WARN defender: $_" }
     # defender skips the lab folders that exist. less rescanning big toolchains.
     # more later by hand: Add-MpPreference -ExclusionPath <dir>.
     try {
-      if (Get-Command Add-MpPreference -EA SilentlyContinue) {
+      if ($DryRun) { Log '  [dry-run] would add defender exclusions for lab folders.' }
+      elseif (Get-Command Add-MpPreference -EA SilentlyContinue) {
         foreach ($ex in @('C:\Setup', "$env:ProgramFiles\MATLAB")) {
           if (Test-Path $ex) { Add-MpPreference -ExclusionPath $ex -EA Stop; Log "  defender exclusion: $ex" }
         }
@@ -530,6 +911,10 @@ if ((-not $NoTweaks) -and (Should-Run 'tweaks')) {
     } catch { Log "  WARN defender exclusions: $_" }
     if ($GamingTweaks) {
       Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile' 'SystemResponsiveness' 0
+      # hardware gpu scheduling. win10 2004+ with a wddm 2.7 driver, default on newer win11. reboot to take.
+      Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers' 'HwSchMode' 2
+      # pin the desktop scheduler shape (short quanta, 3:1 foreground). same as stock, immune to sku drift.
+      Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\PriorityControl' 'Win32PrioritySeparation' 38
       Log '  GamingTweaks applied (safe).'
     }
     if ($KeepFastStartup) {
@@ -557,6 +942,23 @@ if ((-not $NoTweaks) -and (Should-Run 'tweaks')) {
   }
   # feeds = win10's widgets. off.
   Set-Reg 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Feeds' 'ShellFeedsTaskbarViewMode' 2
+  # autostart apps normally sit and wait for an idle desktop. skip the wait.
+  Set-Reg 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Serialize' 'StartupDelayInMSec' 0
+  Set-Reg 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Serialize' 'WaitForIdleState' 0
+  # win11 extras. inert-or-absent keys on 10, so they live in the gate. log says which way.
+  if ($isWin11) {
+    # widgets + chat buttons. nobody asked for either.
+    Set-Reg 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced' 'TaskbarDa' 0
+    Set-Reg 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced' 'TaskbarMn' 0
+    # classic right-click menu: mask the win11 shell handler with an empty COM path.
+    Set-Reg 'HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32' '(Default)' '' 'String'
+    # copilot and recall off. policies only, nothing uninstalled.
+    Set-Reg 'HKCU:\Software\Policies\Microsoft\Windows\WindowsCopilot' 'TurnOffWindowsCopilot' 1
+    Set-Reg 'HKCU:\Software\Policies\Microsoft\Windows\WindowsAI' 'DisableAIDataAnalysis' 1
+    # the recall policy documents device scope too. belt and braces when we can.
+    if ($isAdmin) { Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI' 'DisableAIDataAnalysis' 1 }
+    Log '  win11 extras: classic context menu, widgets/chat buttons, copilot/recall off.'
+  } else { Log '  win11 extras skipped (not win11).' }
   # store suggestions. does nothing on tiny10, costs nothing. leave it.
   Set-Reg 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer' 'DisableSearchBoxSuggestions' 1
   # stop explorer from re-guessing every folder's view type. your settings stay put.
@@ -566,10 +968,13 @@ if ((-not $NoTweaks) -and (Should-Run 'tweaks')) {
   # win7 feel, native: This PC on the desktop, labelled My PC. needs logon to show.
   Set-Reg 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\HideDesktopIcons\NewStartPanel' '{20D04FE0-3AEA-1069-A2D8-08002B30309D}' 0
   try {
-    $pcKey = 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\CLSID\{20D04FE0-3AEA-1069-A2D8-08002B30309D}'
-    if (-not (Test-Path $pcKey)) { New-Item -Path $pcKey -Value 'My PC' -Force -EA Stop | Out-Null }
-    else { Set-ItemProperty -Path $pcKey -Name '(Default)' -Value 'My PC' -EA Stop }
-    Log '  desktop icon: My PC.'
+    if ($DryRun) { Log '  [dry-run] would label the desktop icon My PC.' }
+    else {
+      $pcKey = 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\CLSID\{20D04FE0-3AEA-1069-A2D8-08002B30309D}'
+      if (-not (Test-Path $pcKey)) { New-Item -Path $pcKey -Value 'My PC' -Force -EA Stop | Out-Null }
+      else { Set-ItemProperty -Path $pcKey -Name '(Default)' -Value 'My PC' -EA Stop }
+      Log '  desktop icon: My PC.'
+    }
   } catch { Log "  WARN desktop rename: $_" }
   # taskbar tuning with plain settings, no hooks: small icons, never combine so titles
   # show like sway workspaces, seconds in the clock, tray icons all out, junk
@@ -598,12 +1003,15 @@ if ((-not $NoTweaks) -and (Should-Run 'tweaks')) {
   # start tiles: one reset per profile. clears app-spam back to the default layout
   # (blank on iso installs). marker keeps re-runs and lived-in menus untouched.
   if ($Unattended -and -not (Get-ItemProperty 'HKCU:\Software\Win-Iot' -Name StartTilesDone -EA SilentlyContinue)) {
-    try {
-      Remove-Item 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CloudStore\Store\Cache\DefaultAccount' -Recurse -Force -EA Stop
-      if (-not (Test-Path 'HKCU:\Software\Win-Iot')) { New-Item -Path 'HKCU:\Software\Win-Iot' -Force -EA Stop | Out-Null }
-      New-ItemProperty -Path 'HKCU:\Software\Win-Iot' -Name StartTilesDone -Value 1 -PropertyType DWord -Force -EA Stop | Out-Null
-      Log '  start tiles reset (applies on explorer restart below).'
-    } catch { Log "  WARN tile reset: $_" }
+    if ($DryRun) { Log '  [dry-run] would reset the start tiles once.' }
+    else {
+      try {
+        Remove-Item 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CloudStore\Store\Cache\DefaultAccount' -Recurse -Force -EA Stop
+        if (-not (Test-Path 'HKCU:\Software\Win-Iot')) { New-Item -Path 'HKCU:\Software\Win-Iot' -Force -EA Stop | Out-Null }
+        New-ItemProperty -Path 'HKCU:\Software\Win-Iot' -Name StartTilesDone -Value 1 -PropertyType DWord -Force -EA Stop | Out-Null
+        Log '  start tiles reset (applies on explorer restart below).'
+      } catch { Log "  WARN tile reset: $_" }
+    }
   }
   # stock colors stay. snappier menus below, nothing else visual.
   Set-Reg 'HKCU:\Control Panel\Desktop' 'MenuShowDelay' '100' 'String'
@@ -615,8 +1023,11 @@ if ((-not $NoTweaks) -and (Should-Run 'tweaks')) {
   Set-Reg 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize' 'AppsUseLightTheme' 0
   Set-Reg 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize' 'SystemUsesLightTheme' 0
   # world formats, not us. dates and numbers stay unambiguous on shared docs.
-  try { Set-Culture 'en-001' -EA Stop; Log '  formats: en-001 (world).' }
-  catch { Log "  WARN formats: $_" }
+  if ($DryRun) { Log '  [dry-run] would set formats to en-001.' }
+  else {
+    try { Set-Culture 'en-001' -EA Stop; Log '  formats: en-001 (world).' }
+    catch { Log "  WARN formats: $_" }
+  }
   # looks fast: best-performance preset, but keep ClearType or fonts turn to mush.
   Set-Reg 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects' 'VisualFXSetting' 2
   Set-Reg 'HKCU:\Control Panel\Desktop' 'FontSmoothing' '2' 'String'
@@ -651,9 +1062,13 @@ if ((-not $NoTweaks) -and (Should-Run 'tweaks')) {
     } catch { Log "  WARN tweak matrix: $_" }
   }
   Log '  tweaks done.'
+  Stop-Phase
   # taskbar reads most of that at logon. nudge explorer so it applies now, reboot covers the rest.
-  try { Stop-Process -Name explorer -Force -EA Stop; Log '  explorer restarted.' }
-  catch { Log '  explorer restart skipped (reboot applies everything).' }
+  if ($DryRun) { Log '  [dry-run] would restart explorer.' }
+  else {
+    try { Stop-Process -Name explorer -Force -EA Stop; Log '  explorer restarted.' }
+    catch { Log '  explorer restart skipped (reboot applies everything).' }
+  }
   Complete-Phase 'tweaks'
 } elseif ($ConfigsOnly) { Log 'Tweaks skipped (configs-only).' } else { Log 'Tweaks skipped (-NoTweaks).' }
 
@@ -714,8 +1129,9 @@ function Ensure-Winget {
       if ($off -and (Test-Path $off)) { Copy-Item $off $p -Force; Log "dep (offline): $($d.name)" }
       elseif (-not (Test-Path $p)) {
         # one dead download must not nuke the whole bootstrap
-        try { Log "downloading $($d.name) (slow link, wait)..."; Invoke-WebRequest -Uri $d.url -OutFile $p -UseBasicParsing -TimeoutSec 300 -EA Stop; Log "  got $($d.name) ($([math]::Round((Get-Item $p).Length/1MB,1)) MB)" }
-        catch { Log "WARN download $($d.name): $_"; continue }
+        Log "downloading $($d.name) (slow link, wait)..."
+        if (Invoke-Download -Url $d.url -OutFile $p -TimeoutSec 300) { Log "  got $($d.name) ($([math]::Round((Get-Item $p).Length/1MB,1)) MB)" }
+        else { Log "WARN download $($d.name) failed after 3 tries"; continue }
       } else { Log "dep cached, using: $($d.name) ($([math]::Round((Get-Item $p).Length/1MB,1)) MB)" }
       try { Log "installing $($d.name) (1-3 min on hdd, wait)..."; Add-AppxPackage -Path $p -EA Stop; Log "installed: $($d.name)" }
       catch {
@@ -726,7 +1142,7 @@ function Ensure-Winget {
     }
     # winget 1.24+ needs WindowsAppRuntime 1.x or the msixbundle dies with 0x80073CF3.
     try {
-      $warDone = (Get-AppxPackage -Name 'Microsoft.WindowsAppRuntime.1.8' -EA SilentlyContinue) -ne $null
+      $warDone = $null -ne (Get-AppxPackage -Name 'Microsoft.WindowsAppRuntime.1.8' -EA SilentlyContinue)
       if (-not $warDone) {
         $warOff = $null
         if ($OfflineDir -and (Test-Path $OfflineDir)) {
@@ -744,7 +1160,7 @@ function Ensure-Winget {
           try { if ((Test-Path $warExe) -and ((Get-Item $warExe).Length -lt 1MB)) { Remove-Item $warExe -Force -EA SilentlyContinue } } catch {}
           if (-not (Test-Path $warExe)) {
             Log 'downloading WindowsAppRuntime 1.8 (~80MB, slow link, wait)...'
-            Invoke-WebRequest -Uri 'https://aka.ms/windowsappsdk/1.8/latest/windowsappruntimeinstall-x64.exe' -OutFile $warExe -UseBasicParsing -TimeoutSec 600 -EA Stop
+            if (-not (Invoke-Download -Url 'https://aka.ms/windowsappsdk/1.8/latest/windowsappruntimeinstall-x64.exe' -OutFile $warExe)) { throw 'WindowsAppRuntime download failed after 3 tries' }
             Log "  got WindowsAppRuntime ($([math]::Round((Get-Item $warExe).Length/1MB,1)) MB)"
           } else { Log 'WindowsAppRuntime installer cached, using it.' }
           $proc = Start-Process $warExe -ArgumentList '--quiet' -Wait -PassThru -EA Stop
@@ -765,14 +1181,11 @@ function Ensure-Winget {
       $asset = $rel.assets | Where-Object { $_.name -like '*.msixbundle' -and $_.name -notlike '*symbol*' } | Sort-Object size | Select-Object -First 1
       if (-not $asset) { throw 'no msixbundle in latest release' }
       try {
-        if (Test-Path $msix) {
-          $mlen = (Get-Item $msix).Length
-          if (($mlen -lt 1MB) -or ($asset.size -gt 0 -and $mlen -ne $asset.size)) { Remove-Item $msix -Force -EA SilentlyContinue; Log '  tossed bad partial: winget msixbundle' }
-        }
+        if ((Test-Path $msix) -and -not (Test-DownloadComplete $msix 1MB $asset.size)) { Remove-Item $msix -Force -EA SilentlyContinue; Log '  tossed bad partial: winget msixbundle' }
       } catch {}
       if (-not (Test-Path $msix)) {
         Log "downloading $($asset.name) ($([math]::Round($asset.size/1MB,1)) MB, wait)..."
-        Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $msix -UseBasicParsing -TimeoutSec 600 -EA Stop
+        if (-not (Invoke-Download -Url $asset.browser_download_url -OutFile $msix -ExpectedBytes $asset.size)) { throw 'winget msixbundle download failed after 3 tries' }
         Log "  got winget ($([math]::Round((Get-Item $msix).Length/1MB,1)) MB)"
       } else { Log 'winget msixbundle cached, using it.' }
     }
@@ -788,7 +1201,12 @@ function Ensure-Winget {
   } catch { Log "WARN winget bootstrap failed: $_. Install App Installer manually, then re-run."; return $false }
   finally { $ProgressPreference = $oldProg }
 }
-if ((-not $TweaksOnly) -and (-not $ConfigsOnly)) { $hasWinget = Ensure-Winget } else { $hasWinget = $false }
+if ((-not $TweaksOnly) -and (-not $ConfigsOnly)) {
+  if ($DryRun) {
+    $hasWinget = Test-WingetRuns
+    if (-not $hasWinget) { Log 'winget: missing (dry-run, bootstrap skipped).' }
+  } else { $hasWinget = Ensure-Winget }
+} else { $hasWinget = $false }
 
 # ---------- 2a. choco. plain ps1 + exe/msi, no appx. this is the slick path on stripped images. ----------
 function Ensure-Chocolatey {
@@ -799,7 +1217,21 @@ function Ensure-Chocolatey {
   Log 'choco: missing. Bootstrapping from community.chocolatey.org (needs net, 2-5 min)...'
   $oldProg = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
   try {
-    Invoke-Expression ((New-Object Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+    # the fetch is the flaky part. two more shots before giving up.
+    $body = $null
+    for ($i = 1; $i -le 3 -and -not $body; $i++) {
+      try {
+        $body = (New-Object Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1')
+        if (-not $body -or $body.Length -lt 1024) { throw 'install.ps1 looks truncated' }
+      } catch {
+        Log "  WARN choco bootstrap download attempt $i failed: $($_.Exception.Message)"
+        $body = $null
+        if ($i -lt 3) { Start-Sleep -Seconds (2 * $i) }
+      }
+    }
+    if (-not $body) { throw 'could not fetch install.ps1 after 3 tries' }
+    # same script, executed without Invoke-Expression. PSSA sleeps better, behavior identical.
+    & ([scriptblock]::Create($body))
     Refresh-Path
     if (Get-Command choco -EA SilentlyContinue) { Log 'choco: installed.'; return $true }
     Log 'WARN choco bootstrap: installer ran but choco not on PATH.'; return $false
@@ -824,7 +1256,12 @@ $chocoMap = @{
   'WiresharkFoundation.Wireshark' = 'wireshark'
   'SST.opencode' = 'opencode'
 }
-if ((-not $TweaksOnly) -and (-not $ConfigsOnly)) { $hasChoco = Ensure-Chocolatey } else { $hasChoco = $false }
+if ((-not $TweaksOnly) -and (-not $ConfigsOnly)) {
+  if ($DryRun) {
+    $hasChoco = [bool](Get-Command choco -EA SilentlyContinue)
+    if ($hasChoco) { Log 'choco: found.' } else { Log 'choco: missing (dry-run, bootstrap skipped).' }
+  } else { $hasChoco = Ensure-Chocolatey }
+} else { $hasChoco = $false }
 
 # github-direct. no manager at all, straight off release pages. patterns verified
 # against the live releases api. x64 only, this box is x64. helium has no assets
@@ -863,11 +1300,11 @@ function Install-GitHubAsset($id) {
     } catch {}
     if (-not (Test-Path $dst)) {
       Log "  downloading $($asset.name) ($([math]::Round($asset.size/1MB,1)) MB)..."
-      Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $dst -UseBasicParsing -TimeoutSec 600 -EA Stop
+      if (-not (Invoke-Download -Url $asset.browser_download_url -OutFile $dst -ExpectedBytes $asset.size)) { throw "download failed after 3 tries: $($asset.name)" }
     } else { Log "  cached: $($asset.name)" }
     if (-not (Test-DownloadHash (Get-Item $dst))) {
       Log '  hash mismatch, retrying once...'
-      Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $dst -UseBasicParsing -TimeoutSec 600 -EA Stop
+      if (-not (Invoke-Download -Url $asset.browser_download_url -OutFile $dst -ExpectedBytes $asset.size -Force)) { throw "download failed after 3 tries: $($asset.name)" }
       if (-not (Test-DownloadHash (Get-Item $dst))) { throw "hash still bad for $($asset.name)" }
     }
     Install-OfflineFile (Get-Item $dst)
@@ -890,9 +1327,13 @@ function Install-DirectUrl($id) {
     try { if ((Test-Path $dst) -and ((Get-Item $dst).Length -lt 1MB)) { Remove-Item $dst -Force -EA SilentlyContinue } } catch {}
     if (-not (Test-Path $dst)) {
       Log "  downloading $(Split-Path $url -Leaf)..."
-      Invoke-WebRequest -Uri $url -OutFile $dst -UseBasicParsing -TimeoutSec 600 -EA Stop
+      if (-not (Invoke-Download -Url $url -OutFile $dst)) { throw "download failed after 3 tries: $(Split-Path $url -Leaf)" }
     } else { Log "  cached: $(Split-Path $dst -Leaf)" }
-    if (-not (Test-DownloadHash (Get-Item $dst))) { throw "hash mismatch for $(Split-Path $dst -Leaf)" }
+    if (-not (Test-DownloadHash (Get-Item $dst))) {
+      Log '  hash mismatch, retrying once...'
+      if (-not (Invoke-Download -Url $url -OutFile $dst -Force)) { throw "download failed after 3 tries: $(Split-Path $url -Leaf)" }
+      if (-not (Test-DownloadHash (Get-Item $dst))) { throw "hash still bad for $(Split-Path $dst -Leaf)" }
+    }
     try { Install-OfflineFile (Get-Item $dst) }
     catch {
       # 1638 = that version already on disk. for runtimes that means covered.
@@ -914,22 +1355,31 @@ $runtimeApps = @(
   'Microsoft.DotNet.DesktopRuntime.8'
 )
 # 3.5 + DirectPlay for old vendor tools. some LTSC trims need install media, hence the warn.
-if ($isAdmin -and (-not $TweaksOnly) -and (-not $ConfigsOnly)) {
-  # install media carries its own payload. same-version sources only, per ms docs.
-  $sxs = Get-PSDrive -PSProvider FileSystem -EA SilentlyContinue |
-    ForEach-Object { Join-Path $_.Root 'sources\sxs' } |
-    Where-Object { Test-Path $_ } | Select-Object -First 1
-  if ($sxs) { Log "  features source: $sxs" }
-  foreach ($f in @('NetFx3','DirectPlay')) {
-    # NOTE learned the hard way: native exes don't throw. check the exit code or the log lies.
-    if ($sxs) { $exit = Invoke-Native { DISM /Online /Enable-Feature /FeatureName:$f /All /NoRestart /LimitAccess "/Source:$sxs" | Out-Null } }
-    else { $exit = Invoke-Native { DISM /Online /Enable-Feature /FeatureName:$f /All /NoRestart | Out-Null } }
-    # 3010 = success, reboot pending. not a failure.
-    if ($exit -in @(0,3010)) { Log "${f}: enabled.$(if ($exit -eq 3010) { ' (reboot pending, normal)' })" }
-    else { Log "WARN ${f}: DISM exit=$exit (insert install media so sources\sxs is visible) - enable manually for old vendor tools." }
-  }
-  Complete-Phase 'features'
-} elseif ((-not $TweaksOnly) -and (-not $ConfigsOnly)) { Log 'WARN NetFx3/DirectPlay: skipped (not admin).' }
+if ((-not $TweaksOnly) -and (-not $ConfigsOnly)) {
+  if ($DryRun) {
+    Log '  [dry-run] would enable NetFx3 + DirectPlay via DISM.'
+  } elseif ($isAdmin) {
+    Start-Phase 'features'
+    # install media carries its own payload. same-version sources only, per ms docs.
+    $sxs = Get-PSDrive -PSProvider FileSystem -EA SilentlyContinue |
+      ForEach-Object { Join-Path $_.Root 'sources\sxs' } |
+      Where-Object { Test-Path $_ } | Select-Object -First 1
+    if ($sxs) { Log "  features source: $sxs" }
+    $featFailed = 0
+    foreach ($f in @('NetFx3','DirectPlay')) {
+      # NOTE learned the hard way: native exes don't throw. check the exit code or the log lies.
+      if ($sxs) { $exit = Invoke-Native { DISM /Online /Enable-Feature /FeatureName:$f /All /NoRestart /LimitAccess "/Source:$sxs" | Out-Null } }
+      else { $exit = Invoke-Native { DISM /Online /Enable-Feature /FeatureName:$f /All /NoRestart | Out-Null } }
+      # 3010 = success, reboot pending. not a failure.
+      if ($exit -in @(0,3010)) { Log "${f}: enabled.$(if ($exit -eq 3010) { ' (reboot pending, normal)' })" }
+      else { Log "WARN ${f}: DISM exit=$exit (insert install media so sources\sxs is visible) - enable manually for old vendor tools."; $featFailed++ }
+    }
+    Stop-Phase
+    # a failed feature stays open so -Idempotent runs retry it next pass.
+    if ($featFailed -eq 0) { Complete-Phase 'features' }
+    else { Log "  features left open ($featFailed failed, no install media?) - re-run to retry." }
+  } else { Log 'WARN NetFx3/DirectPlay: skipped (not admin).' }
+}
 # 4.8 is already in the image. moving on.
 $coreApps = @(
   'LGUG2Z.komorebi',
@@ -950,10 +1400,79 @@ $coreApps = @(
   # me. terminal agent, reads .m files like anything else.
   'SST.opencode'
 )
+# shell pack (taste port from the linux box): small native cli tools, no wsl.
+# winget covers them, or Get-Offline stages the files like any other app.
+$shellApps = @(
+  'Starship.Starship',
+  'ajeetdsouza.zoxide',
+  'junegunn.fzf',
+  'sharkdp.bat',
+  'eza-community.eza',
+  'Fastfetch-cli.Fastfetch'
+)
+$coreApps += $shellApps
 $optionalApps = @('Obsidian.Obsidian','Spotify.Spotify')
 if ($IncludeOptional) { $coreApps += $optionalApps }
+# study pack, -IncludeStudy. keep in sync with ISO/Get-Offline.ps1.
+$studyApps = @('DigitalScholar.Zotero','SumatraPDF.SumatraPDF','MiKTeX.MiKTeX','Typst.Typst')
+# terminal wants win10 1903+. on ltsc 2019 it would just fail every run.
+$studyBuild = 0
+$wtOk = (-not $osInfo) -or (-not [int]::TryParse([string]$osInfo.Build, [ref]$studyBuild)) -or ($studyBuild -ge 18362)
+if ($wtOk) { $studyApps += 'Microsoft.WindowsTerminal' }
+if ($IncludeStudy) {
+  if (-not $wtOk) { Log 'study: windows terminal skipped (build too old for it).' }
+  $coreApps += $studyApps
+}
+
+# -Only/-SkipApps: substring match against app ids. runtimes can be filtered
+# too, but that is on you, some apps need them.
+function Test-AppFilter($id, $patterns) {
+  foreach ($p in $patterns) { if ($id -like "*$p*") { return $true } }
+  return $false
+}
+$appsAll = @($runtimeApps + $coreApps)
+if ($Only.Count) {
+  $appsAll = @($appsAll | Where-Object { Test-AppFilter $_ $Only })
+  if (-not $appsAll.Count) { Log 'WARN: -Only matched no app ids. check the patterns.' }
+  else { Log ('only: ' + ($appsAll -join ', ')) }
+}
+if ($SkipApps.Count) {
+  $dropped = @($appsAll | Where-Object { Test-AppFilter $_ $SkipApps })
+  if (@($dropped | Where-Object { $_ -like 'Microsoft.*' }).Count) { Log 'WARN: -SkipApps filtered runtimes. apps that need them may fail.' }
+  if ($dropped.Count) { Log ('skipping on request: ' + ($dropped -join ', ')) }
+  $appsAll = @($appsAll | Where-Object { -not (Test-AppFilter $_ $SkipApps) })
+}
 
 $failed = @()
+$installed = @()
+# apps we actually tried an engine on this run. skip-only failures don't need a retry pass.
+$script:appAttempted = @{}
+# per-app state so -Idempotent re-runs skip what already landed and retry
+# only what failed. one small json next to phases.json.
+function Get-AppState {
+  $af = Join-Path $StateDir 'apps.json'
+  if (-not (Test-Path $af)) { return @{} }
+  try {
+    $o = Get-Content $af -Raw | ConvertFrom-Json
+    $d = @{}
+    foreach ($p in $o.PSObject.Properties) { $d[$p.Name] = $p.Value }
+    return $d
+  } catch { return @{} }
+}
+function Test-AppDone($id) {
+  if ($Force) { return $false }
+  $st = Get-AppState
+  return ($st.ContainsKey($id))
+}
+function Set-AppDone($id) {
+  if ($DryRun) { return }
+  try {
+    if (-not (Test-Path $StateDir)) { New-Item -ItemType Directory -Force -Path $StateDir -EA Stop | Out-Null }
+    $st = Get-AppState
+    $st[$id] = (Get-Date).ToString('o')
+    ($st | ConvertTo-Json) | Set-Content -Path (Join-Path $StateDir 'apps.json') -Encoding UTF8 -EA Stop
+  } catch { Log "  WARN app state $id`: $_" }
+}
 function Find-OfflineInstaller($id) {
   if (-not $OfflineDir -or -not (Test-Path $OfflineDir)) { return $null }
   # exact match: per-ID subfolder from Get-Offline.ps1. also sidesteps VC_redist name collisions.
@@ -1018,57 +1537,98 @@ function Install-OfflineFile($file) {
     }
   }
 }
-if ((-not $TweaksOnly) -and (-not $ConfigsOnly) -and (Should-Run 'apps') -and ($hasWinget -or $hasChoco -or ($OfflineDir -and (Test-Path $OfflineDir)))) {
-  foreach ($id in ($runtimeApps + $coreApps)) {
-    $off = Find-OfflineInstaller $id
-    if ($off -and $Unattended) {
-      # staged beats everything. no net needed, no manager needed.
-      Log "offline install: $($off.Name) for $id"
-      try { Install-OfflineFile $off; Log '  ok (offline)'; continue }
-      catch { Log "  WARN offline failed, falling through: $_" }
-    }
-    if ($hasWinget -and $online) {
-      Log "winget install: $id"
-      $exit = Invoke-Native { winget install --id $id -e --silent --accept-source-agreements --accept-package-agreements }
-      if ($exit -eq 0) { Log '  ok'; continue }
-      Log "  WARN exit=$exit, falling through"
-    }
-    if ($hasChoco -and $chocoMap.ContainsKey($id)) {
-      # NOTE native exe, exit code is the truth. try/catch alone lies.
-      Log "choco install: $($chocoMap[$id]) (for $id)"
-      $exit = Invoke-Native { choco install $chocoMap[$id] -y --no-progress }
-      if ($exit -eq 0) { Log '  ok'; continue }
-      Log "  WARN exit=$exit, falling through"
-    }
-    if ($online -and $gitMap.ContainsKey($id)) {
-      Log "github release: $id"
-      try { Install-GitHubAsset $id; Log '  ok (github)'; continue }
-      catch { Log "  WARN github ${id}: $_"; $failed += $id; continue }
-    }
-    if ($online -and $directMap.ContainsKey($id)) {
-      Log "direct download: $id"
-      try { Install-DirectUrl $id; Log '  ok (direct)'; continue }
-      catch { Log "  WARN direct ${id}: $_"; $failed += $id; continue }
-    }
-    if ($off) {
-      Log "  SKIP $id (staged but no -Unattended. re-run with -Unattended or run $($off.Name) by hand)"
-      $failed += $id
-    } elseif (-not $chocoMap.ContainsKey($id) -and -not $gitMap.ContainsKey($id) -and -not $directMap.ContainsKey($id)) {
-      Log "  SKIP $id (no choco/github source. stage it: Get-Offline.ps1 -GapsOnly on a normal pc)"
-      $failed += $id
-    } else { $failed += $id }
+function Install-App($id) {
+  # one app through the engines, in order. true when something landed.
+  $off = Find-OfflineInstaller $id
+  if ($off -and $Unattended) {
+    # staged beats everything. no net needed, no manager needed.
+    $script:appAttempted[$id] = $true
+    Log "offline install: $($off.Name) for $id"
+    try { Install-OfflineFile $off; Log '  ok (offline)'; return $true }
+    catch { Log "  WARN offline failed, falling through: $_" }
   }
   if ($hasWinget -and $online) {
-    $exit = Invoke-Native { winget upgrade --all --silent --accept-source-agreements --accept-package-agreements }
-    if ($exit -eq 0) { Log '  winget upgrade done.' } else { Log "  WARN winget upgrade exit=$exit" }
+    $script:appAttempted[$id] = $true
+    Log "winget install: $id"
+    $exit = Invoke-Native { winget install --id $id -e --silent --accept-source-agreements --accept-package-agreements }
+    if ($exit -eq 0) { Log '  ok'; return $true }
+    Log "  WARN exit=$exit, falling through"
   }
-  elseif ($hasWinget) { Log 'SKIP winget upgrade (offline).' }
-  if ($hasChoco -and $online) {
-    $exit = Invoke-Native { choco upgrade all -y --no-progress }
-    if ($exit -eq 0) { Log '  choco upgrade done.' } else { Log "  WARN choco upgrade exit=$exit" }
+  if ($hasChoco -and $chocoMap.ContainsKey($id)) {
+    # NOTE native exe, exit code is the truth. try/catch alone lies.
+    $script:appAttempted[$id] = $true
+    Log "choco install: $($chocoMap[$id]) (for $id)"
+    $exit = Invoke-Native { choco install $chocoMap[$id] -y --no-progress }
+    if ($exit -eq 0) { Log '  ok'; return $true }
+    Log "  WARN exit=$exit, falling through"
   }
-  elseif ($hasChoco) { Log 'SKIP choco upgrade (offline).' }
-  Complete-Phase 'apps'
+  if ($online -and $gitMap.ContainsKey($id)) {
+    $script:appAttempted[$id] = $true
+    Log "github release: $id"
+    try { Install-GitHubAsset $id; Log '  ok (github)'; return $true }
+    catch { Log "  WARN github ${id}: $_"; return $false }
+  }
+  if ($online -and $directMap.ContainsKey($id)) {
+    $script:appAttempted[$id] = $true
+    Log "direct download: $id"
+    try { Install-DirectUrl $id; Log '  ok (direct)'; return $true }
+    catch { Log "  WARN direct ${id}: $_"; return $false }
+  }
+  if ($off) {
+    Log "  SKIP $id (staged but no -Unattended. re-run with -Unattended or run $($off.Name) by hand)"
+  } elseif (-not $chocoMap.ContainsKey($id) -and -not $gitMap.ContainsKey($id) -and -not $directMap.ContainsKey($id)) {
+    Log "  SKIP $id (no choco/github source. stage it: Get-Offline.ps1 -GapsOnly on a normal pc)"
+  }
+  return $false
+}
+if ((-not $TweaksOnly) -and (-not $ConfigsOnly) -and (Should-Run 'apps') -and ($DryRun -or $hasWinget -or $hasChoco -or ($OfflineDir -and (Test-Path $OfflineDir)))) {
+  Start-Phase 'apps'
+  $appTotal = $appsAll.Count
+  $appIdx = 0
+  foreach ($id in $appsAll) {
+    $appIdx++
+    if ($DryRun) { Log "  [dry-run] would install: $id"; continue }
+    if ($Idempotent -and (Test-AppDone $id)) { Log "  skip (done): $id"; continue }
+    Write-Progress -Activity 'installing apps' -Status "$appIdx/$appTotal $id" -PercentComplete ([int]((($appIdx - 1) * 100) / [math]::Max(1, $appTotal))) -EA SilentlyContinue
+    if (Install-App $id) { $installed += $id; Set-AppDone $id }
+    else { $failed += $id }
+  }
+  Write-Progress -Activity 'installing apps' -Completed -EA SilentlyContinue
+  # one free retry pass. flaky links and rate limits are the usual causes.
+  # skip-only failures never hit an engine, retrying them just re-logs the skip.
+  if ($failed.Count -and $online) {
+    $retryList = @($failed | Where-Object { $script:appAttempted.ContainsKey($_) })
+    $skipOnly = @($failed | Where-Object { -not $script:appAttempted.ContainsKey($_) })
+    if ($retryList.Count) {
+      Log "retrying $($retryList.Count) failed app(s)..."
+      $failed = @($skipOnly)
+      foreach ($id in $retryList) {
+        Log "retry: $id"
+        if (Install-App $id) { $installed += $id; Set-AppDone $id }
+        else { $failed += $id }
+      }
+    }
+  }
+  if ($Only.Count) { Log 'bulk upgrades skipped (selective -Only run).' }
+  elseif ($DryRun) { Log '[dry-run] would upgrade packages (winget upgrade --all / choco upgrade all).' }
+  else {
+    if ($hasWinget -and $online) {
+      $exit = Invoke-Native { winget upgrade --all --silent --accept-source-agreements --accept-package-agreements }
+      if ($exit -eq 0) { Log '  winget upgrade done.' } else { Log "  WARN winget upgrade exit=$exit" }
+    }
+    elseif ($hasWinget) { Log 'SKIP winget upgrade (offline).' }
+    if ($hasChoco -and $online) {
+      $exit = Invoke-Native { choco upgrade all -y --no-progress }
+      if ($exit -eq 0) { Log '  choco upgrade done.' } else { Log "  WARN choco upgrade exit=$exit" }
+    }
+    elseif ($hasChoco) { Log 'SKIP choco upgrade (offline).' }
+  }
+  Stop-Phase
+  # failures keep the phase open so -Idempotent re-runs retry them. an empty
+  # list (typo in -Only, everything -SkipApps'd) stays open too, on purpose.
+  if ($failed.Count -eq 0 -and $appsAll.Count -gt 0) { Complete-Phase 'apps' }
+  elseif ($appsAll.Count -eq 0) { Log '  nothing selected, apps phase left open.' }
+  else { Log "  apps left open ($($failed.Count) failed) - re-run to retry." }
 } elseif ($TweaksOnly) { Log 'Tweaks-only: apps skipped.' } elseif ($ConfigsOnly) { Log 'Configs-only: apps skipped.' } else {
   Log 'SKIP installs (no winget, no choco, no -OfflineDir). Get net for choco, or stage with Get-Offline.ps1 - nothing marked failed yet.'
 }
@@ -1079,7 +1639,8 @@ Log 'PATH refreshed.'
 
 # bench drivers (ch340/cp210x/st-link). point at a folder of extracted vendor infs.
 if ($DriverDir -and (Test-Path $DriverDir) -and (-not $TweaksOnly) -and (-not $ConfigsOnly)) {
-  if ($isAdmin) {
+  if ($DryRun) { Log "  [dry-run] would add drivers from $DriverDir." }
+  elseif ($isAdmin) {
     Log "drivers: $DriverDir"
     $exit = Invoke-Native { pnputil /add-driver "$DriverDir\*.inf" /subdirs /install }
     if ($exit -in @(0,3010)) { Log "  drivers staged+installed$(if ($exit -eq 3010) { ' (reboot pending)' })" }
@@ -1092,8 +1653,10 @@ Log 'NOTE manual-only: ExplorerBlurMica (Maplespe releases, optional), Spicetify
 # ---------- 3. configs ----------
 if ((-not $TweaksOnly) -and (Should-Run 'configs')) {
 Log 'Configs...'
+Start-Phase 'configs'
 function Copy-Config($src, $dst) {
   if (-not (Test-Path $src)) { Log "  SKIP missing in repo (not fatal): $src"; return }
+  if ($DryRun) { Log "  [dry-run] would copy: $dst"; return }
   New-Item -ItemType Directory -Force -Path (Split-Path $dst) | Out-Null
   Copy-Item $src $dst -Force -EA Stop
   Log "  $dst"
@@ -1126,19 +1689,39 @@ if (-not $codium) {
 # appdata dir only shows up after first launch, so seed it when the exe exists.
 $vs = Join-Path $env:APPDATA 'VSCodium\User\settings.json'
 if ((Test-Path (Split-Path $vs)) -or ($codium -and (Test-Path $codium))) {
-  New-Item -ItemType Directory -Force -Path (Split-Path $vs) | Out-Null
+  if (-not $DryRun) { New-Item -ItemType Directory -Force -Path (Split-Path $vs) | Out-Null }
   Copy-Config (Join-Path $Repo 'VSCodium\settings.json') $vs
+  Copy-Config (Join-Path $Repo 'VSCodium\keybindings.json') (Join-Path $env:APPDATA 'VSCodium\User\keybindings.json')
+  # darkmatter theme ships as a folder extension. the folder name has to carry
+  # the version or vscodium pretends it is not installed.
+  $themeDst = Join-Path $env:USERPROFILE '.vscode-oss\extensions\xfcemlg.darkmatter-theme-0.6.0'
+  if ($DryRun) { Log "  [dry-run] would copy: $themeDst (plus drop any older versions)" }
+  else {
+    try {
+      # a version bump would otherwise leave both folders there and vscodium gets grumpy.
+      Get-ChildItem (Split-Path $themeDst -Parent) -Directory -Filter 'xfcemlg.darkmatter-theme-*' -EA SilentlyContinue |
+        Where-Object { $_.Name -ne (Split-Path $themeDst -Leaf) } |
+        ForEach-Object { Remove-Item $_.FullName -Recurse -Force -EA SilentlyContinue; Log "  dropped old theme folder: $($_.Name)" }
+      New-Item -ItemType Directory -Force -Path $themeDst | Out-Null
+      Copy-Item (Join-Path $Repo 'VSCodium\darkmatter-theme\*') $themeDst -Recurse -Force -EA Stop
+      Log "  $themeDst"
+    } catch { Log "  WARN vscodium theme: $_" }
+  }
 }
 else { Log '  VSCodium not installed yet - settings kept in repo VSCodium/.' }
-if ($codium -and (Test-Path $codium) -and (-not $ConfigsOnly)) {
+if ($DryRun -and (-not $ConfigsOnly)) {
+  Log '  [dry-run] would install vscodium extensions from extensions.txt.'
+} elseif ($codium -and (Test-Path $codium) -and (-not $ConfigsOnly)) {
   $extList = @('yasirarafat.opencode-ai-chat','Gimly81.matlab')
   $extFile = Join-Path $Repo 'VSCodium\extensions.txt'
   if (Test-Path $extFile) {
-    $extList = Get-Content $extFile -EA SilentlyContinue |
+    $extList = @(Get-Content $extFile -EA SilentlyContinue |
       Where-Object { $_ -and $_ -notmatch '^\s*#' } |
       ForEach-Object { $_.Trim() } |
-      Where-Object { $_ }
+      Where-Object { $_ })
   }
+  # study pack rides on top, both names live on open-vsx.org (checked, not guessed).
+  if ($IncludeStudy) { $extList += @('James-Yu.latex-workshop','myriad-dreamin.tinymist') }
   foreach ($ext in $extList) {
     try {
       $exit = Invoke-Native { & $codium --install-extension $ext }
@@ -1152,6 +1735,8 @@ if ($codium -and (Test-Path $codium) -and (-not $ConfigsOnly)) {
 
 # pip libs for bench work. needs python on PATH, so this runs after the refresh above.
 if (-not $ConfigsOnly) {
+  if ($DryRun) { Log '  [dry-run] would pip install: numpy scipy matplotlib pyserial pymodbus' }
+  else {
   try {
     $exit = Invoke-Native { python -m pip install --upgrade pip }
     if ($exit -ne 0) { throw "pip upgrade exit=$exit" }
@@ -1159,6 +1744,7 @@ if (-not $ConfigsOnly) {
     if ($exit -ne 0) { throw "pip install exit=$exit" }
     Log '  python libs: numpy scipy matplotlib pyserial pymodbus'
   } catch { Log '  WARN pip libs skipped - run manually: python -m pip install numpy scipy matplotlib pyserial pymodbus' }
+  }
 } else { Log '  python libs skipped (configs-only).' }
 
 # fresh installs get configs; -ConfigsOnly (or -Force) re-deploys over existing ones.
@@ -1170,11 +1756,27 @@ Copy-Fresh (Join-Path $Repo 'Vesktop\settings.json') (Join-Path $env:APPDATA 'Ve
 Copy-Fresh (Join-Path $Repo 'qBittorrent\qbittorrent.ini') (Join-Path $env:APPDATA 'qBittorrent\qbittorrent.ini')
 Copy-Fresh (Join-Path $Repo 'VLC\vlcrc') (Join-Path $env:APPDATA 'vlc\vlcrc')
 Copy-Fresh (Join-Path $Repo 'OBS\profiles\Recording\basic.ini') (Join-Path $env:APPDATA 'obs-studio\basic\profiles\Recording\basic.ini')
-Copy-Fresh (Join-Path $Repo 'Vesktop\quickcss.css') (Join-Path $env:APPDATA 'Vesktop\settings\quickcss.css')
+# quickcss ships as a placeholder, so an untouched one upgrades to the real
+# darkmatter theme on re-run. a quickcss you edited yourself is kept.
+$qcss = Join-Path $env:APPDATA 'Vesktop\settings\quickcss.css'
+$qsrc = Join-Path $Repo 'Vesktop\quickcss.css'
+$qcur = $null
+if (Test-Path $qcss) { $qcur = Get-Content $qcss -Raw -EA SilentlyContinue }
+if ((Test-QuickcssStale $qcur) -or $ConfigsOnly -or $Force) { Copy-Config $qsrc $qcss } else { Log "  keep existing: $qcss" }
 # opencode global config: curated MCP servers (context7, playwright). fresh-only.
 Copy-Fresh (Join-Path $Repo 'config\opencode.json') (Join-Path $env:USERPROFILE '.config\opencode\opencode.json')
+# study pack configs, fresh-only like the rest. -IncludeStudy territory.
+if ($IncludeStudy) {
+  Copy-Fresh (Join-Path $Repo 'SumatraPDF\SumatraPDF-settings.txt') (Join-Path $env:LOCALAPPDATA 'SumatraPDF\SumatraPDF-settings.txt')
+  # terminal config only where terminal can actually land (same build gate as the install).
+  if ($wtOk) { Copy-Fresh (Join-Path $Repo 'WindowsTerminal\settings.json') (Join-Path $env:LOCALAPPDATA 'Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalState\settings.json') }
+  # latex workshop points at the per-user sumatra path. a machine-wide install needs a nudge.
+  if (-not (Test-Path (Join-Path $env:LOCALAPPDATA 'SumatraPDF\SumatraPDF.exe')) -and (Test-Path (Join-Path $env:ProgramFiles 'SumatraPDF\SumatraPDF.exe'))) {
+    Log '  NOTE: SumatraPDF sits in Program Files. fix the two latex-workshop viewer paths in VSCodium\settings.json.'
+  }
+}
 $ocPlugins = Join-Path $env:USERPROFILE '.config\opencode\plugins'
-if (-not (Test-Path $ocPlugins)) { New-Item -ItemType Directory -Force -Path $ocPlugins | Out-Null }
+if (-not $DryRun -and -not (Test-Path $ocPlugins)) { New-Item -ItemType Directory -Force -Path $ocPlugins | Out-Null }
 if (Test-Path (Join-Path $Repo 'Helium\master_preferences')) {
   $heData = Join-Path $env:LOCALAPPDATA 'Helium\User Data'
   if (-not (Test-Path $heData)) { Copy-Config (Join-Path $Repo 'Helium\master_preferences') (Join-Path $heData 'master_preferences') }
@@ -1184,6 +1786,8 @@ if (Test-Path (Join-Path $Repo 'Helium\master_preferences')) {
 # drop your .ttfs in Fonts/ and they get installed. admin only, windows rules.
 $fontDir = Join-Path $Repo 'Fonts'
 if ((Test-Path $fontDir) -and $isAdmin) {
+  if ($DryRun) { Log '  [dry-run] would install fonts from Fonts/.' }
+  else {
   try {
     $shell = New-Object -ComObject Shell.Application -EA Stop
     $fFolder = $shell.Namespace(0x14)
@@ -1191,7 +1795,9 @@ if ((Test-Path $fontDir) -and $isAdmin) {
       try { $fFolder.CopyHere($_.FullName, 0x10); Log "  font: $($_.Name)" } catch { Log "  WARN font $($_.Name): $_" }
     }
   } catch { Log "  WARN fonts: shell object unavailable on this trim - right-click Install the .ttfs." }
+  }
 } else { Log '  Fonts: drop JetBrainsMono Nerd Font + Monocraft .ttf into Fonts/ and re-run as admin (or right-click Install).' }
+Stop-Phase
 Complete-Phase 'configs'
 } elseif ($TweaksOnly) { Log 'Configs skipped (tweaks-only).' } else { Log 'Configs skipped (already done).' }
 
@@ -1201,7 +1807,9 @@ Complete-Phase 'configs'
 # checks state first. on tiny10 half of this is already gone, it just says so and moves on.
 if ((-not $NoDebloat) -and (-not $TweaksOnly) -and (-not $ConfigsOnly) -and (Should-Run 'debloat')) {
   Log 'Ripping out the replaced stuff...'
-  if (-not $isAdmin) { Log '  skipped (not admin).' }
+  Start-Phase 'debloat'
+  if ($DryRun) { Log '  [dry-run] would remove IE11, Edge, Media Player, ISE, WordPad, OneDrive, and sweep appx.' }
+  elseif (-not $isAdmin) { Log '  skipped (not admin).' }
   else {
     try {
       $ie = Get-WindowsOptionalFeature -Online -FeatureName 'Internet-Explorer-Optional-amd64' -EA Stop
@@ -1261,19 +1869,22 @@ if ((-not $NoDebloat) -and (-not $TweaksOnly) -and (-not $ConfigsOnly) -and (Sho
       }
     } else { Log '  appx sweep skipped (no appx provider).' }
   }
+  Stop-Phase
   Complete-Phase 'debloat'
 } else { if ($TweaksOnly) { Log 'Tweaks-only: debloat skipped.' } elseif ($ConfigsOnly) { Log 'Configs-only: debloat skipped.' } else { Log 'Debloat skipped (-NoDebloat).' } }
 
 # ---------- 5. autostart Komorebi + whkd (user logon), stock panel untouched ----------
 if ((-not $TweaksOnly) -and (-not $ConfigsOnly) -and (Should-Run 'autostart')) {
 Log 'Autostart...'
-function Set-StartupShortcut($name, $target, $args) {
+Start-Phase 'autostart'
+function Set-StartupShortcut($name, $target, $argl) {
   $sm = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup'
   $lnk = Join-Path $sm "$name.lnk"
+  if ($DryRun) { Log "  [dry-run] would create startup shortcut: $name"; return }
   try {
     $ws = New-Object -ComObject WScript.Shell
     $sc = $ws.CreateShortcut($lnk)
-    $sc.TargetPath = $target; $sc.Arguments = $args; $sc.WorkingDirectory = (Split-Path $target); $sc.Save()
+    $sc.TargetPath = $target; $sc.Arguments = $argl; $sc.WorkingDirectory = (Split-Path $target); $sc.Save()
     Log "  startup: $name"
   } catch { Log "  WARN startup ${name}: $_" }
 }
@@ -1285,6 +1896,8 @@ if ($kExe -and (Test-Path $kExe)) { Set-StartupShortcut 'komorebi' $kExe '' } el
 if ($wExe -and (Test-Path $wExe)) { Set-StartupShortcut 'whkd' $wExe '' } else { Log '  whkd exe not found yet - install it, shortcut applies next run.' }
 
 # helium default. per-user, needs no admin.
+if ($DryRun) { Log '  [dry-run] would set Helium as default browser.' }
+else {
 try {
   $helium = Get-CmdPath 'helium'
   if (-not $helium) {
@@ -1297,8 +1910,11 @@ try {
   if ($helium) { Start-Process $helium -ArgumentList '--make-default-browser' -WindowStyle Hidden -EA Stop; Log '  Helium default-browser requested (confirm in Settings > Apps > Default apps).' }
   else { Log '  Helium not found yet - set default manually in Settings > Apps > Default apps.' }
 } catch { Log "  WARN default browser: $_" }
+}
 
 # auth can't run unattended, so it goes on the desktop as a double-click thing.
+if ($DryRun) { Log '  [dry-run] would write Desktop Win-Iot-Finish.cmd.' }
+else {
 try {
   $finishCmd = '@echo off' + "`r`n" + 'title Win-Iot finish setup' + "`r`n" +
     'powershell -NoProfile -ExecutionPolicy Bypass -Command "opencode auth login"' + "`r`n" +
@@ -1309,10 +1925,14 @@ try {
   Set-Content -Path $finishPath -Value $finishCmd -Encoding Ascii -Force -EA Stop
   Log "  finish helper: $finishPath"
 } catch { Log "  WARN finish helper: $_" }
+}
+Stop-Phase
 Complete-Phase 'autostart'
 } elseif ($ConfigsOnly) { Log 'Autostart/browser/finish skipped (configs-only).' } else { Log 'Autostart/browser/finish skipped (tweaks-only).' }
 
 if ((-not $TweaksOnly) -and (-not $ConfigsOnly)) {
+  if ($DryRun) { Log 'Smoke test skipped (dry-run).' }
+  else {
   Log 'Smoke test...'
   foreach ($s in @(
     @{ n='komorebi'; cmd={ komorebi --version } },
@@ -1327,11 +1947,15 @@ if ((-not $TweaksOnly) -and (-not $ConfigsOnly)) {
     if ((Invoke-Native $s.cmd) -eq 0) { Log "  smoke ok: $($s.n)" }
     else { Log "  smoke MISSING: $($s.n)" }
   }
+  }
 }
 
 # ---------- 6. finale. sweep up, including our own mess. ----------
 if (-not $NoTweaks) {
   Log 'Cleanup...'
+  Start-Phase 'cleanup'
+  if ($DryRun) { Log '  [dry-run] would clear temp files, prune old logs, hibernate off, disk cleanup.' }
+  else {
   # installer caches + the fallback log dir survive for faster re-runs. rest goes.
   try {
     Get-ChildItem (Join-Path $env:TEMP '*') -Exclude 'winget-bootstrap','github-dl','direct-dl','Win-Iot-Setup' -EA SilentlyContinue |
@@ -1353,27 +1977,57 @@ if (-not $NoTweaks) {
     try { Start-Process cleanmgr -ArgumentList '/VERYLOWDISK' -Wait -EA Stop; Log '  disk cleanup done.' }
     catch { Log '  WARN disk cleanup: cleanmgr missing (common on tiny10).' }
   }
+  }
+  Stop-Phase
   Complete-Phase 'cleanup'
 } elseif ($ConfigsOnly) { Log 'Cleanup skipped (configs-only).' } else { Log 'Cleanup skipped (-NoTweaks).' }
 
+# machine-readable run report. one json, easy to diff between runs.
+try {
+  $report = [ordered]@{
+    stamp     = $Stamp
+    mode      = if ($TweaksOnly) { 'tweaks-only' } elseif ($ConfigsOnly) { 'configs-only' } else { 'full' }
+    dryRun    = [bool]$DryRun
+    admin     = [bool]$isAdmin
+    online    = [bool]$online
+    os        = if ($osInfo) {
+      $osName = if ($osInfo.PSObject.Properties['Caption']) { $osInfo.Caption } elseif ($osInfo.PSObject.Properties['ProductName']) { $osInfo.ProductName } else { 'unknown' }
+      $osBuild = if ($osInfo.PSObject.Properties['BuildNumber']) { $osInfo.BuildNumber } elseif ($osInfo.PSObject.Properties['Build']) { $osInfo.Build } else { '' }
+      "$osName build $osBuild"
+    } else { 'unknown' }
+    phases    = $script:phaseTimes
+    installed = $installed
+    failed    = $failed
+    warnings  = $script:warnCount
+    log       = $LogFile
+  }
+  $reportPath = Join-Path $LogDir "report-$Stamp.json"
+  ($report | ConvertTo-Json -Depth 4) | Set-Content -Path $reportPath -Encoding UTF8 -EA Stop
+  Log "Report: $reportPath"
+} catch { Log "  WARN report: $_" }
 Log '---'
 if ($failed.Count) { Log ('FAILED/RETRY: ' + ($failed -join ', ')) } elseif ((-not $TweaksOnly) -and (-not $ConfigsOnly)) { Log 'All installs reported ok.' }
+# one-line scoreboard, then per-phase seconds. details are in the log already.
+Log ("summary: $(if ($DryRun) { 'dry-run, ' })installed $($installed.Count), failed $($failed.Count), warnings $($script:warnCount)")
+foreach ($p in $script:phaseTimes.Keys) { Log ("  {0}: {1}s" -f $p, $script:phaseTimes[$p]) }
 # success means caches are dead weight on a small disk. failures keep them for retry.
-if ((-not $TweaksOnly) -and (-not $ConfigsOnly) -and ($failed.Count -eq 0)) {
+if ((-not $TweaksOnly) -and (-not $ConfigsOnly) -and (-not $DryRun) -and ($failed.Count -eq 0)) {
   foreach ($c in @('winget-bootstrap','github-dl','direct-dl')) {
     Remove-Item (Join-Path $env:TEMP $c) -Recurse -Force -EA SilentlyContinue
   }
   Log '  installer caches purged.'
 }
 Log "Log: $LogFile"
-if (-not $TweaksOnly) {
+if ($DryRun) { Log 'Dry-run finished. nothing changed, nothing marked done.' }
+elseif (-not $TweaksOnly) {
 Log 'NEXT:'
 Log '  1. reboot, Komorebi + whkd autostart, stock taskbar as-is.'
 Log '  2. double-click Desktop Win-Iot-Finish.cmd (opencode auth + optional password).'
 Log '  3. MATLAB via campus license + USB-serial drivers (CH340/CP210x/ST-Link) manually.'
 } elseif ($ConfigsOnly) { Log 'Configs-only done.' } else { Log 'Tweaks-only done. reboot to feel the taskbar changes.' }
-if ($Reboot) {
+if ($Reboot -and -not $DryRun) {
   Log 'rebooting in 60s (-Reboot). save your stuff.'
   shutdown /r /t 60 /c 'Win-Iot setup done. rebooting.' 2>&1 | Out-Null
 }
+if ($Reboot -and $DryRun) { Log 'reboot skipped (dry-run).' }
 if ($transcriptOn) { try { Stop-Transcript | Out-Null } catch {} }

@@ -1,11 +1,14 @@
 $root = Split-Path $PSScriptRoot -Parent
 $bad = 0
-Get-ChildItem $root -Recurse -Filter *.json | Where-Object { $_.FullName -notmatch '\\ISO\\build\\|\\node_modules\\' } | ForEach-Object {
+# npm lockfiles use "" keys on purpose. ps 5.1 ConvertFrom-Json chokes on that, and they are not ours anyway.
+Get-ChildItem $root -Recurse -Filter *.json | Where-Object { $_.FullName -notmatch '\\ISO\\build\\|\\node_modules\\|package-lock\.json$' } | ForEach-Object {
+  $f = $_
+  $rel = $f.FullName.Substring($root.Length + 1)
   try {
-    $null = Get-Content $_.FullName -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
-    Write-Host ('OK   ' + ($_.FullName.Substring($root.Length + 1)))
+    $null = Get-Content $f.FullName -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    Write-Host ('OK   ' + $rel)
   } catch {
-    Write-Host ('FAIL ' + $_.FullName + ' :: ' + $_.Exception.Message)
+    Write-Host ('FAIL ' + $rel + ' :: ' + $_.Exception.Message)
     $bad++
   }
 }

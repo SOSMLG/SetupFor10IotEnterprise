@@ -7,7 +7,7 @@ $here = Split-Path $MyInvocation.MyCommand.Path -Parent
 $repo = Split-Path $here -Parent
 if (-not (Test-Path (Join-Path $repo 'install-Win-Iot.ps1'))) { $repo = 'C:\Setup' }
 $installer = Join-Path $repo 'install-Win-Iot.ps1'
-$argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$installer`"", '-Unattended')
+$argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$installer`"", '-Unattended', '-IncludeStudy')
 foreach ($cand in @((Join-Path $here 'Offline'), 'C:\Setup\Offline', (Join-Path $repo 'Offline'))) {
   if (Test-Path $cand) { $argList += @('-OfflineDir', "`"$cand`""); break }
 }
